@@ -1,0 +1,605 @@
+# Technical Plan — Personal Spending Tracker (Flutter)
+
+> Section 4 is written so each phase can be executed in a **fresh session** with only:
+> `spending-tracker-spec.md` + `CLAUDE.md` (auto-loaded from repo root) + this file.
+
+## Context
+
+[spending-tracker-spec.md](spending-tracker-spec.md) is a locked product spec for a single-user,
+local-only expense tracker. Its core risk is stated in §1: **manual entry must be fast enough to
+become an automatic habit**. §8 already locked the framework to Flutter.
+
+The working directory currently contains only the spec — this is a greenfield build.
+
+**Environment verified:** Flutter 3.35.4 / Dart 3.9.2, Android SDK 36.1.0, Windows desktop
+(VS 2022), Chrome. No macOS toolchain on this machine.
+
+**Decisions confirmed in planning** (resolving spec §7 and the §2.10 deferral):
+
+| Question | Decision |
+| --- | --- |
+| Default date range (§7) | **Last 30 days** (rolling) |
+| Analytics line-graph buckets (§7) | **User-selectable Day/Week/Month, default Week.** A week is always 7 calendar days; when the selected range spans < 14 days the *default* falls back to Day so the chart isn't a single point. The manual toggle always overrides. |
+| Per-platform UI (§2.10) | **One Material 3 design** for iOS + Android |
+| iOS build path (§2.10) | **Defer iOS, stay iOS-clean**; Mac verification checkpoints at Phase 4 and Phase 8 |
+| Reparenting labels | **In scope.** Not in the spec, but it's what makes nesting usable given that fast-path entry creates top-level labels only. Cheap to add (§2 below). |
+| Confirmation coverage | **Every** create / rename / move / delete confirms first, with impact counts. Broader than the spec's §2.3/§2.4 minimum. |
+
+---
+
+## 1. Stack
+
+| Concern | Choice | Why |
+| --- | --- | --- |
+| Local DB | **drift** + `drift_flutter` 0.3.x | Real SQL (recursive CTEs for rollup), reactive `.watch()`, first-class migrations, all five platforms from one call. Verified on pub.dev. |
+| State | **Riverpod 2**, hand-written providers | Composable filter state; `StreamProvider` maps 1:1 onto drift's `watch()`. No `riverpod_generator` — build_runner already carries drift; one codegen tool keeps regeneration simple. |
+| Charts | **fl_chart** 1.2.x | Line + bar, maintained, verified on pub.dev. |
+| Routing | **go_router** | Named routes keep ~8 screens decoupled. |
+| Export | `csv` + `share_plus` + `path_provider` (mobile), `file_selector` (desktop) | iOS has no user-visible filesystem; the share sheet is the correct handoff. |
+| Misc | `uuid` (v7), `intl` | |
+
+Full dependency list in **Appendix A**. Versions resolve at scaffold time — no pins beyond majors.
+
+---
+
+## 2. Data Model
+
+Two tables. Amounts are **integer cents**, timestamps **UTC epoch millis**, PKs **UUID v7 strings**.
+Literal drift definitions in **Appendix B**.
+
+### `labels` — Categories *and* Payment Methods in one table
+
+§2.4 gives Categories and Payment Methods **byte-identical rules**: freeform, 3-level nesting,
+selectable at any level, create-with-confirmation, rename cascades, delete cascades to children,
+in-use deletion reassigns to a placeholder. Two tables would duplicate the repository, tree builder,
+type-ahead picker, cascade logic, move logic, and manage screen.
+
+One table with a `kind` discriminator writes each of those **once**, parameterized by kind. The cost
+is a `WHERE kind = ?` on every query. That trade is strongly worth it here.
+
+Key columns: `id`, `kind`, `name`, `parent_id`, `depth` (0–2), `is_placeholder`, `sort_order`,
+`created_at`, `updated_at`, `deleted_at`.
+
+- `depth` is denormalized so the 3-level cap (§2.4) is a `CHECK`, not a recursive query per insert.
+  It must be recomputed for the whole subtree on a move.
+- Unique index on `(kind, IFNULL(parent_id,''), name) WHERE deleted_at IS NULL` — prevents duplicate
+  siblings and drives the type-ahead's "does this already exist?" check.
+- Two placeholder rows (`is_placeholder = 1`) seeded in migration v1 at **fixed, well-known UUIDs**
+  (`kNoCategoryId` / `kNoPaymentMethodId`), guarded against rename, delete, move, and being a parent.
+
+### `transactions`
+
+Key columns: `id`, `amount_cents` (`CHECK > 0`), `occurred_at`, `category_id`, `payment_method_id`,
+`note` (`CHECK` non-blank), `extra_notes`, `created_at`, `updated_at`, `deleted_at`.
+
+### What falls out of this design
+
+**Rename cascade (§2.4) is free.** Transactions reference labels by `id`, never by name, so a rename
+is a one-row `UPDATE` and every past entry displays the new name. Nothing is orphaned.
+
+**Reparenting is invisible to transactions**, for the same reason — but it *does* change analytics
+rollups, since a moved subtree's spending now rolls up under a different parent. That consequence
+belongs in the move confirmation dialog.
+
+**"Needs attention" (§2.6) is derived, never stored.** Flagged iff
+`category_id == kNoCategoryId || payment_method_id == kNoPaymentMethodId`. No boolean column to keep
+in sync, and the flag clears itself the instant an entry is recategorized. Because placeholders are
+ordinary rows with ordinary ids, they also work as normal filter values with zero special-casing —
+exactly what §2.6 asks for.
+
+**Category rollup (§2.8) is one recursive CTE**, not a Dart tree walk:
+
+```sql
+WITH RECURSIVE subtree(id) AS (
+  SELECT id FROM labels WHERE id = :rootId AND deleted_at IS NULL
+  UNION ALL
+  SELECT l.id FROM labels l JOIN subtree s ON l.parent_id = s.id WHERE l.deleted_at IS NULL
+)
+```
+
+The same CTE powers rollup totals, chart series, the filtered list, cascade delete, and move validation.
+
+**Move validity math.** Let `h(x)` = subtree height of `x` (max descendant depth − depth of `x`; 0 for
+a leaf). Moving `x` under parent `p` of depth `dp` (use `dp = -1` for top level) is valid iff:
+
+```
+dp + 1 + h(x) <= 2        // still within 3 levels
+AND p != x AND p not in subtree(x)   // no cycles
+AND no live sibling under p shares x's name
+```
+
+On success, shift `depth` by `(dp + 1) - depth(x)` across the whole subtree in one transaction.
+
+**Text search (§2.7) uses `LIKE` over lowercased `note || extra_notes`.** A personal dataset is
+thousands of rows; FTS5 would add sync triggers for no measurable gain. Escape hatch if it ever gets slow.
+
+### Sync-readiness (§2.10)
+
+§2.10 asks to keep the barrier to future sync low where it doesn't conflict with anything else.
+Three habits buy most of that for near-zero cost:
+
+1. **UUID v7 PKs** — no collisions when merging devices; time-sortable as a bonus.
+2. **`created_at` / `updated_at` on every row** — the basis of any last-write-wins merge.
+3. **Soft delete (`deleted_at`)** — hard deletes are unmergeable; a tombstone is one column plus one
+   predicate. This is *not* an audit trail (no field-level history), so it doesn't conflict with §6.
+
+Explicitly **not** building now: no CRDTs, no vector clocks, no sync engine, no server.
+
+### `TransactionFilter` — one object, three consumers
+
+```dart
+class TransactionFilter {
+  final DateRange range;          // preset (default: last30Days) or custom
+  final String? categoryId;       // null = all; placeholder id is a normal value
+  final bool rollupCategory;      // include descendants
+  final String? paymentMethodId;
+  final String query;             // matches note + extra_notes
+}
+```
+
+Satisfies three requirements at once: composable filters (§2.7), "reuse the history list rather than
+duplicate it" (§2.8.4), and "export respects whatever filters are active" (§2.9). Export takes a
+`TransactionFilter` and has no filter logic of its own — that's what makes §2.9 true by construction.
+
+---
+
+## 3. Folder Structure
+
+```
+money_spending_tracker/
+├─ CLAUDE.md
+├─ docs/
+│  ├─ spending-tracker-spec.md       # locked source of truth, do not edit
+│  └─ implementation-plan.md         # this file
+├─ analysis_options.yaml
+├─ pubspec.yaml
+├─ lib/
+│  ├─ main.dart
+│  ├─ app.dart                       # MaterialApp.router, theme, routes
+│  ├─ core/                          # pure Dart, no Flutter imports, fully unit-testable
+│  │  ├─ ids.dart                    # UUID v7
+│  │  ├─ money.dart                  # cents <-> text: parse, validate, format
+│  │  ├─ date_range.dart             # presets + custom; default last30Days
+│  │  ├─ bucketing.dart              # Day/Week/Month bucketing
+│  │  └─ constants.dart              # kNoCategoryId, kNoPaymentMethodId, kMaxDepth, kWeekStartsOn
+│  ├─ data/
+│  │  ├─ database.dart               # AppDatabase, migrations, placeholder seed
+│  │  ├─ tables.dart                 # Labels, Transactions
+│  │  ├─ daos/{label_dao,transaction_dao}.dart
+│  │  ├─ models/{transaction_filter,label_node,impacts,analytics_series}.dart
+│  │  └─ repositories/{label_repository,transaction_repository}.dart
+│  ├─ features/                      # each: <name>_screen.dart, <name>_providers.dart, widgets/
+│  │  ├─ entry/                      # §2.2, §2.3
+│  │  ├─ history/                    # §2.5–2.7
+│  │  ├─ analytics/                  # §2.8
+│  │  ├─ labels/                     # §2.4
+│  │  └─ export/                     # §2.9
+│  ├─ shared/
+│  │  ├─ providers.dart              # database + repository providers (overridden in tests)
+│  │  └─ widgets/
+│  │     ├─ transaction_list.dart    # ← the §2.8.4 reuse point
+│  │     ├─ transaction_tile.dart    # ← §2.6 needs-attention styling
+│  │     ├─ label_picker.dart        # ← §2.2/§2.4 type-ahead, kind-parameterized
+│  │     ├─ date_range_picker.dart
+│  │     └─ confirm_dialog.dart      # ← the single confirmation primitive (§3.1)
+│  └─ theme/theme.dart
+└─ test/{core,data,widget}/
+```
+
+**Layering rule:** `core` imports nothing; `data` imports `core`; `features` import `data`/`core`/
+`shared`; features never import each other — promote anything shared to `shared/`.
+
+**No hand-written mapping layer.** drift's generated row classes *are* the domain model. Hand-written
+models exist only for composites drift can't express (`TransactionWithLabels`, `LabelNode`,
+`DeleteImpact`, `MoveImpact`, `AnalyticsSeries`).
+
+### 3.1 Confirmation policy
+
+Every destructive-or-structural action confirms first, through one shared `confirmDialog()` primitive.
+Each confirmation states its **impact counts**, fetched via a `preview*` repository call (one `COUNT`).
+
+| Action | Confirmation copy |
+| --- | --- |
+| Create label — inline, entry form (§2.4) | "Add 'X' as a new category?" |
+| Create label — manage screen, nested | "Add 'X' under 'Parent'?" |
+| Rename (§2.4) | "Rename 'Old' to 'New'? This updates the name on N past entries." |
+| Move / reparent | "Move 'X' and its N sub-categories under 'Y'? Past entries are unchanged, but analytics rollups will shift." |
+| Delete leaf (§2.4) | "Delete 'X'? N entries will move to No Category." |
+| Delete parent (§2.4, §5) | "Delete 'X' and its N sub-categories? M entries will move to No Category." |
+| Delete transaction (§2.3) | "Delete this transaction?" |
+| Bulk recategorize (§2.5) | "Reassign N transactions to 'X'?" |
+
+Move to top level uses the same dialog with "under Top level".
+
+---
+
+## 4. Build Order
+
+Each phase is independently runnable and verifiable, and written to be handed to a **fresh session**.
+
+**Session prompt template:** `Implement Phase N from docs/implementation-plan.md.`
+(`CLAUDE.md` auto-loads; the phase brief names everything else it needs.)
+
+Phase 2 precedes Phase 3 because the entry form depends on the label picker.
+
+| Phase | Scope | Model / effort | Rationale |
+| --- | --- | --- | --- |
+| 0 | Scaffold | **Sonnet, low** | Mechanical: `flutter create`, deps, theme, router shell. |
+| 1 | Data foundation | **Sonnet, medium** | Appendix B gives literal DDL; this is transcription + tests. |
+| 2 | Labels | **Opus, high** | Hardest logic in the app: recursive CTEs, atomic cascade, depth-shift on move, cycle prevention. Spend here. |
+| 3 | Entry form | **Sonnet, medium** | Standard form + validation against fixed contracts. |
+| 4 | History & filters | **Sonnet, medium** | Dynamic query composition has sharp edges — if the filter tests fail twice, escalate to Opus medium. |
+| 5 | Bulk recategorize | **Sonnet, medium** | Selection state + one atomic update. |
+| 6 | Analytics | **Opus, medium** | Rollup + bucketing correctness. Charts alone would be Sonnet, but they share a session with the aggregation layer. |
+| 7 | CSV export | **Sonnet, low** | Mechanical, and the filter logic is already built. |
+| 8 | Platform hardening | **Opus, medium** | Open-ended platform debugging; poor fit for a cheap tier. |
+
+Fast mode is fine throughout — it doesn't downgrade the model.
+
+---
+
+### Phase 0 — Scaffold & rails (§2.10, §8)
+
+**Preconditions:** empty repo containing only the spec.
+**Create:** `pubspec.yaml` (Appendix A), `analysis_options.yaml` (strict lints), `lib/main.dart`,
+`lib/app.dart`, `lib/theme/theme.dart`, `lib/core/constants.dart`.
+`flutter create . --platforms=android,ios,windows`.
+**Shell:** bottom nav **History | Analytics**; FAB on History → Add; app-bar overflow → Manage
+Categories / Manage Payment Methods / Export.
+**Accept:** `flutter analyze` clean; app launches on Android emulator **and** Windows desktop; all
+nav destinations reachable with placeholder bodies.
+
+### Phase 1 — Data foundation (§2.2, §2.4, §2.10)
+
+**Preconditions:** Phase 0.
+**Create:** `lib/data/tables.dart` (**Appendix B verbatim**), `lib/data/database.dart` (schema v1,
+indexes, placeholder seed at the Appendix-B UUIDs), `lib/core/{ids,money,date_range,bucketing}.dart`,
+tests under `test/core/`.
+**Contracts:** `Money.tryParse` handles `1,234.56` / `1234` / `.5` and rejects `0`, negatives, and
+non-numerics. `DateRange.last30Days` is the default. `Bucket.{day,week,month}`; weeks are 7 days
+starting `kWeekStartsOn` (Monday; one-line change to Sunday).
+**Accept:** `dart run build_runner build` succeeds; `flutter test test/core` green; a fresh in-memory
+DB contains exactly two placeholder rows; inserting `amount_cents = 0` or a blank `note` throws.
+
+### Phase 2 — Categories & Payment Methods (§2.4) ⭐ hardest phase
+
+**Preconditions:** Phase 1.
+**Create:** `lib/data/daos/label_dao.dart`, `lib/data/repositories/label_repository.dart`,
+`lib/data/models/{label_node,impacts}.dart`, `lib/features/labels/` (manage screen),
+`lib/shared/widgets/{label_picker,confirm_dialog}.dart`.
+**Contracts (Appendix C):** `create`, `rename`, `move`, `deleteCascade`, `previewDelete`,
+`previewMove`, `subtreeIds`, `watchTree`, `search`.
+**Rules to implement exactly:** depth cap via the move-validity math in §2; cascade delete =
+resolve subtree → reassign referencing transactions to the placeholder → soft-delete subtree, all in
+one `db.transaction`; placeholders reject rename/move/delete/parenting; move recomputes `depth` across
+the subtree; sibling-name uniqueness enforced on create **and** move.
+**UI:** manage screen tree with per-node actions Add sub-category / Rename / Move / Delete, each behind
+§3.1 confirmation. `LabelPicker` is type-ahead, kind-parameterized, selectable at any level, and offers
+"Add 'X' as a new category?" for unmatched text — **creating top-level only** (keeps the §1 fast path fast;
+nesting happens on the manage screen, and move closes the loop).
+**Accept:** `test/data/label_repository_test.dart` covers — cascade delete reassigns to placeholder;
+depth cap rejects a 4th level; duplicate sibling rejected; move rejects a cycle; move rejects a
+depth-overflow; move recomputes descendant depths; rename leaves transaction rows untouched;
+placeholder mutations throw.
+
+### Phase 3 — Entry, edit, delete (§2.2, §2.3)
+
+**Preconditions:** Phase 2 (needs `LabelPicker`, `confirmDialog`).
+**Create:** `lib/data/daos/transaction_dao.dart`, `lib/data/repositories/transaction_repository.dart`
+(upsert/delete only for now), `lib/features/entry/`.
+**Form:** amount (>0, `Money.tryParse`), date (defaults to now, freely editable to any date), category
+picker, payment-method picker, mandatory note, optional extra notes. Delete behind §3.1 confirmation.
+**Accept:** widget tests reject amount `0`, negative, and blank note; add → edit → delete round trip
+persists; editing any field of a past entry works (§2.3).
+
+### Phase 4 — History & needs-attention (§2.6, §2.7, §5)
+
+**Preconditions:** Phase 3.
+**Create:** `lib/data/models/transaction_filter.dart`, `watchFiltered` on the repository,
+`lib/features/history/`, `lib/shared/widgets/{transaction_list,transaction_tile,date_range_picker}.dart`.
+**Rules:** newest-first default; all filters compose (AND, never exclusive); category filter offers the
+placeholder as a normal value; search covers `note` **and** `extra_notes`; needs-attention styling is
+derived, not stored; empty result renders an empty state and never falls back to unfiltered data (§5).
+**Accept:** filter-composition tests (range ∧ category ∧ search) return the intersection; filtering to
+"No Category" returns exactly the flagged entries; empty state renders.
+→ **Mac checkpoint #1** — core loop on a real iOS device.
+
+### Phase 5 — Bulk recategorization (§2.5)
+
+**Preconditions:** Phase 4.
+**Create:** `historySelectionProvider`, selection UI inside the existing list, `bulkReassign` on the
+repository.
+**Rules:** long-press enters selection mode **in the history list** — no separate screen (§2.5);
+select-all-in-current-filter; reassign category and/or payment method in one atomic transaction,
+behind §3.1 confirmation.
+**Accept:** filter to "No Category" → select all → reassign → flags clear and the filtered list empties.
+
+### Phase 6 — Analytics (§2.8)
+
+**Preconditions:** Phase 5. Reuses the Phase 2 rollup CTE and the Phase 4 `TransactionList`.
+**Create:** `lib/data/models/analytics_series.dart`, `watchSummary` on the repository,
+`lib/features/analytics/`.
+**Layout, top to bottom:** total → line chart (Day/Week/Month toggle, default Week per the Context
+table) → bar chart by category (**Combined scope only**) → the reused `TransactionList`.
+**Rules:** scope = single category at any level, or Combined; parent scope rolls up all descendants
+automatically; line chart plots per-period totals, not a cumulative sum.
+**Accept:** a parent's rollup total equals the sum of its subtree's transactions; bar chart absent for
+single-category scope; bucket toggle re-buckets without refetching filters; a 5-day range defaults to
+Day buckets. **Load the `dataviz` skill before writing chart code.**
+
+### Phase 7 — CSV export (§2.9)
+
+**Preconditions:** Phase 6 (so both call sites exist).
+**Create:** `lib/features/export/`.
+**Rules:** serialize from the caller's active `TransactionFilter` — no independent filter logic. Share
+sheet on mobile, save dialog on desktop. Amounts export as decimal strings, dates as ISO-8601 local.
+**Accept:** exporting from a filtered view yields exactly that filtered set; exporting from an empty
+filtered view yields a header-only file, not all data.
+
+### Phase 8 — Platform hardening (§2.10)
+
+**Preconditions:** Phases 0–7.
+Windows desktop pass. Perf check against ~5k seeded rows (list scroll, analytics query). Manual-backup
+guidance in the README.
+→ **Mac checkpoint #2** — full iOS pass, sideload / SideStore path per §8.
+
+---
+
+## 5. Remaining Assumptions
+
+1. **Weeks start Monday** (`kWeekStartsOn` — one-line change to Sunday).
+2. **Line chart plots per-period totals**, not a cumulative running sum ("how am I trending", §2.8).
+3. **Currency formats from the device locale** via `intl`. Multi-currency is a §6 non-goal, so there's
+   no currency column and no setting.
+4. **Sort order within a label's siblings is alphabetical** by default; `sort_order` exists in the
+   schema for future manual ordering but isn't surfaced in v1.
+
+---
+
+## 6. Verification
+
+- `flutter analyze` clean and `flutter test` green at every phase boundary.
+- Repository tests run against an **in-memory drift DB** (`databaseProvider` overridden) — no mocks for
+  DB behavior, since cascade/rollup/move correctness *is* SQL behavior.
+- `drift_dev schema dump` + generated migration tests from Phase 1 onward. The on-device DB is the
+  user's only copy — there is no server backup — which makes migration safety unusually important.
+- End-to-end smoke per phase on Android emulator + Windows desktop; iOS at the two Mac checkpoints.
+
+---
+
+## Appendix A — Dependencies
+
+```yaml
+dependencies:
+  flutter: {sdk: flutter}
+  drift: ^2.28.0
+  drift_flutter: ^0.3.1
+  flutter_riverpod: ^2.6.0
+  go_router: ^14.0.0
+  fl_chart: ^1.2.0
+  intl: ^0.20.0
+  uuid: ^4.5.0
+  csv: ^6.0.0
+  share_plus: ^10.0.0
+  path_provider: ^2.1.0
+  file_selector: ^1.0.0
+
+dev_dependencies:
+  flutter_test: {sdk: flutter}
+  drift_dev: ^2.28.0
+  build_runner: ^2.4.0
+  flutter_lints: ^5.0.0
+```
+
+Resolve to current stable at scaffold time; the majors above are the intent.
+
+## Appendix B — Table definitions (`lib/data/tables.dart`)
+
+```dart
+import 'package:drift/drift.dart';
+
+enum LabelKind { category, paymentMethod }
+
+class Labels extends Table {
+  TextColumn get id => text()();
+  TextColumn get kind => textEnum<LabelKind>()();
+  TextColumn get name => text()();
+  TextColumn get parentId => text().nullable().references(Labels, #id)();
+  IntColumn  get depth => integer()();                    // 0..2
+  BoolColumn get isPlaceholder => boolean().withDefault(const Constant(false))();
+  IntColumn  get sortOrder => integer().withDefault(const Constant(0))();
+  IntColumn  get createdAt => integer()();                // UTC epoch ms
+  IntColumn  get updatedAt => integer()();
+  IntColumn  get deletedAt => integer().nullable()();
+
+  @override Set<Column> get primaryKey => {id};
+  @override List<String> get customConstraints => [
+    'CHECK (depth BETWEEN 0 AND 2)',
+    'CHECK (length(trim(name)) > 0)',
+  ];
+}
+
+class Transactions extends Table {
+  TextColumn get id => text()();
+  IntColumn  get amountCents => integer()();
+  IntColumn  get occurredAt => integer()();               // UTC epoch ms, user-editable
+  TextColumn get categoryId => text().references(Labels, #id)();
+  TextColumn get paymentMethodId => text().references(Labels, #id)();
+  TextColumn get note => text()();
+  TextColumn get extraNotes => text().nullable()();
+  IntColumn  get createdAt => integer()();
+  IntColumn  get updatedAt => integer()();
+  IntColumn  get deletedAt => integer().nullable()();
+
+  @override Set<Column> get primaryKey => {id};
+  @override List<String> get customConstraints => [
+    'CHECK (amount_cents > 0)',
+    'CHECK (length(trim(note)) > 0)',
+  ];
+}
+```
+
+Indexes and the partial unique index are declared in `database.dart`'s migration via
+`customStatement`, since drift's table API doesn't express partial indexes:
+
+```sql
+CREATE UNIQUE INDEX ux_labels_sibling
+  ON labels (kind, IFNULL(parent_id,''), name) WHERE deleted_at IS NULL;
+CREATE INDEX ix_labels_parent   ON labels (kind, parent_id);
+CREATE INDEX ix_tx_occurred     ON transactions (occurred_at DESC) WHERE deleted_at IS NULL;
+CREATE INDEX ix_tx_category     ON transactions (category_id);
+CREATE INDEX ix_tx_payment      ON transactions (payment_method_id);
+```
+
+**Seeded placeholder UUIDs** (fixed forever — referenced from `core/constants.dart`):
+
+```dart
+const kNoCategoryId      = '00000000-0000-7000-8000-000000000001';
+const kNoPaymentMethodId = '00000000-0000-7000-8000-000000000002';
+const kMaxDepth = 2;   // 0-indexed → 3 levels
+```
+
+## Appendix C — Name inventory
+
+Fixed so phases built in separate sessions don't invent divergent names.
+
+```dart
+// lib/data/repositories/label_repository.dart
+Stream<List<LabelNode>> watchTree(LabelKind kind);
+Future<List<Label>>     search(LabelKind kind, String query);
+Future<Label?>          findByName(LabelKind kind, String name, {String? parentId});
+Future<Label>           create({required LabelKind kind, required String name, String? parentId});
+Future<void>            rename(String id, String newName);
+Future<MoveImpact>      previewMove(String id, String? newParentId);
+Future<void>            move(String id, String? newParentId);
+Future<DeleteImpact>    previewDelete(String id);
+Future<void>            deleteCascade(String id);
+Future<Set<String>>     subtreeIds(String id);
+
+// lib/data/repositories/transaction_repository.dart
+Stream<List<TransactionWithLabels>> watchFiltered(TransactionFilter f);
+Future<List<TransactionWithLabels>> listFiltered(TransactionFilter f);   // export
+Stream<AnalyticsSummary>            watchSummary(TransactionFilter f, Bucket bucket);
+Future<void>                        upsert(TransactionDraft d);
+Future<void>                        delete(String id);
+Future<void>                        bulkReassign({required Set<String> ids,
+                                                  String? categoryId, String? paymentMethodId});
+
+// models
+class DeleteImpact { final int descendantCount; final int affectedTransactionCount; }
+class MoveImpact   { final int subtreeCount; final bool valid; final String? reason; }
+class AnalyticsSummary { final int totalCents; final List<BucketPoint> series;
+                         final List<CategoryTotal> byCategory; }
+
+// providers — lib/shared/providers.dart + feature *_providers.dart
+databaseProvider · labelRepositoryProvider · transactionRepositoryProvider
+labelTreeProvider(LabelKind)                       // family
+historyFilterProvider · historyTransactionsProvider · historySelectionProvider
+analyticsFilterProvider · analyticsBucketProvider · analyticsSummaryProvider
+```
+
+---
+
+## 7. Draft `CLAUDE.md`
+
+Written to the repo root as `CLAUDE.md`. Reproduced here so this document stays self-contained.
+
+````markdown
+# Personal Spending Tracker
+
+Single-user, offline-first expense tracker. Flutter, local SQLite, no accounts, no server.
+
+## Source of truth
+
+`docs/spending-tracker-spec.md` is a **locked product spec** — treat it as read-only. If work seems to
+require contradicting it, stop and raise it rather than reinterpreting. Its §6 non-goals are
+guardrails: no multi-user, no sync, no multi-currency, no income/refunds, no edit audit trail, no
+duplicate detection, no bank integration.
+
+`docs/implementation-plan.md` holds the data model, phase briefs, and the fixed name inventory
+(Appendix C) — consult it before inventing a repository method or provider name.
+
+Section numbers below refer to the spec.
+
+## Stack
+
+drift + drift_flutter (SQLite) · Riverpod 2 (hand-written providers) · go_router · fl_chart ·
+csv + share_plus + path_provider + file_selector · uuid · intl
+
+## Locked decisions
+
+- **Money is `int` cents.** Never `double`, never `String`, anywhere. Parse and format only at the UI
+  edge via `core/money.dart`.
+- **Timestamps are UTC epoch millis** in the DB; convert to local only for display.
+- **Primary keys are UUID v7 strings**, generated in Dart. No autoincrement integers.
+- **Soft delete everywhere** (`deleted_at`). Every read filters `deleted_at IS NULL`. This is a sync
+  tombstone, not an audit trail.
+- **Categories and Payment Methods share the `labels` table**, discriminated by `kind`. §2.4 gives
+  them identical rules, so repositories, the picker, and the manage screen are written once and
+  parameterized by kind. Never add a second table for one of them.
+- **"No Category" / "No Payment Method" are real seeded rows** at fixed UUIDs. They cannot be
+  renamed, deleted, moved, or used as a parent.
+- **Needs-attention (§2.6) is derived, never stored** — an entry is flagged iff it points at a
+  placeholder. Do not add a flag column.
+- **Category rollup uses the recursive CTE** in `label_dao.dart`. Do not walk trees in Dart.
+- **`TransactionFilter` is the only filtering vocabulary.** History, Analytics, and CSV export all
+  take one. Export has no filter logic of its own — that's what makes §2.9 true by construction.
+- **One Material 3 design across iOS and Android** (§2.10 decision). Adapt only where the platform
+  genuinely differs: share sheet, date picker, back-swipe.
+- **Default date range is Last 30 days.** Analytics buckets are user-selectable Day/Week/Month,
+  defaulting to Week; a week is always 7 calendar days, and the *default* falls back to Day when the
+  range spans under 14 days. The manual toggle always wins.
+- **Labels can be reparented** (not in the spec; added deliberately). Validity:
+  `newParentDepth + 1 + subtreeHeight <= 2`, no cycles, no duplicate sibling name. A move shifts
+  `depth` across the whole subtree in one transaction, leaves transactions untouched, and shifts
+  analytics rollups.
+
+## Layering
+
+`core` (pure Dart, no Flutter imports) ← `data` ← `features` / `shared`.
+Features never import other features — promote anything shared to `shared/`.
+drift's generated row classes are the domain model; add hand-written models only for composites.
+
+## Confirmations
+
+**Every create, rename, move, and delete confirms first**, via the shared `confirmDialog()` in
+`shared/widgets/confirm_dialog.dart`. Each dialog states impact counts from a `preview*` repository
+call — how many entries a rename touches, how many sub-labels a delete takes with it, how many
+entries fall back to "No Category". Never wire a structural mutation straight to an `onPressed`.
+
+## Staying iOS-clean
+
+iOS cannot be built on this Windows machine and Mac access is limited, so avoid accumulating iOS debt:
+
+- Before adding any package, confirm it lists **iOS** support on pub.dev.
+- Never write to a hardcoded path — always `path_provider`.
+- iOS has no user-visible filesystem: files reach the user via the **share sheet**, not a save path.
+- No Android-only permission flows in shared code.
+
+## Conventions
+
+- Every multi-step write goes in a single `db.transaction { }` — cascade delete + reassign, and
+  move + depth-shift, must be atomic.
+- UI reads DB state through drift `.watch()` streams behind a `StreamProvider`. Do not manually
+  invalidate providers after a write; the stream handles it.
+- Filtered views show a true empty state — never silently fall back to unfiltered data (§5).
+- Schema changes bump the drift schema version and add a migration test. The on-device DB is the
+  user's only copy; there is no backup to restore from.
+- Before writing chart code, load the `dataviz` skill.
+
+## Commands
+
+```
+flutter run -d windows            # fastest inner loop
+flutter run -d <android-device>
+dart run build_runner build --delete-conflicting-outputs   # after touching tables/ or database.dart
+flutter analyze
+flutter test
+```
+
+## Design north star
+
+§1: manual entry must be fast enough to become a habit. When a change adds a tap, a required field,
+or a confirmation to the **add-transaction** path, that's a real cost — weigh it explicitly. (The
+confirmation policy above applies to label and delete operations, not to logging a transaction.)
+````
