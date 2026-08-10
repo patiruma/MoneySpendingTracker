@@ -1,6 +1,16 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import 'data/database.dart';
+import 'data/models/transaction_filter.dart';
+import 'data/tables.dart';
+import 'features/analytics/analytics_screen.dart';
+import 'features/entry/entry_screen.dart';
+import 'features/export/export_action.dart';
+import 'features/history/history_screen.dart';
+import 'features/labels/labels_screen.dart';
+import 'shared/providers.dart';
 import 'theme/theme.dart';
 
 class App extends StatelessWidget {
@@ -19,48 +29,49 @@ class App extends StatelessWidget {
 }
 
 final GoRouter _router = GoRouter(
-  initialLocation: '/history',
+  initialLocation: '/entry',
   routes: [
     ShellRoute(
       builder: (context, state, child) => _RootShell(child: child),
       routes: [
         GoRoute(
+          path: '/entry',
+          builder: (context, state) => const EntryScreen(embedded: true),
+        ),
+        GoRoute(
           path: '/history',
-          builder: (context, state) => const _PlaceholderScreen(title: 'History'),
+          builder: (context, state) => const HistoryScreen(),
         ),
         GoRoute(
           path: '/analytics',
-          builder: (context, state) => const _PlaceholderScreen(title: 'Analytics'),
+          builder: (context, state) => const AnalyticsScreen(),
         ),
       ],
     ),
     GoRoute(
-      path: '/entry',
-      builder: (context, state) => const _PlaceholderPage(title: 'Add Transaction'),
+      path: '/entry/edit',
+      builder: (context, state) => EntryScreen(transaction: state.extra as Transaction?),
     ),
     GoRoute(
       path: '/labels/categories',
-      builder: (context, state) => const _PlaceholderPage(title: 'Manage Categories'),
+      builder: (context, state) => const LabelsScreen(kind: LabelKind.category),
     ),
     GoRoute(
       path: '/labels/payment-methods',
-      builder: (context, state) => const _PlaceholderPage(title: 'Manage Payment Methods'),
-    ),
-    GoRoute(
-      path: '/export',
-      builder: (context, state) => const _PlaceholderPage(title: 'Export'),
+      builder: (context, state) => const LabelsScreen(kind: LabelKind.paymentMethod),
     ),
   ],
 );
 
-enum _OverflowAction { manageCategories, managePaymentMethods, export }
+enum _OverflowAction { manageCategories, managePaymentMethods }
 
-class _RootShell extends StatelessWidget {
+class _RootShell extends ConsumerWidget {
   const _RootShell({required this.child});
 
   final Widget child;
 
-  static const _tabs = ['/history', '/analytics'];
+  static const _tabs = ['/entry', '/history', '/analytics'];
+  static const _titles = ['Add Transaction', 'History', 'Analytics'];
 
   int _indexForLocation(String location) {
     final index = _tabs.indexWhere((tab) => location.startsWith(tab));
@@ -68,15 +79,28 @@ class _RootShell extends StatelessWidget {
   }
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final location = GoRouterState.of(context).uri.toString();
     final currentIndex = _indexForLocation(location);
-    final isHistory = currentIndex == 0;
+    // Export has no filter logic of its own (§2.9) — it reads whichever
+    // view's filter is live. History and Analytics hold separate filters, so
+    // the export button only appears on those tabs and reads the matching one.
+    final TransactionFilter? activeFilter = switch (currentIndex) {
+      1 => ref.watch(historyFilterProvider),
+      2 => ref.watch(analyticsFilterProvider),
+      _ => null,
+    };
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(isHistory ? 'History' : 'Analytics'),
+        title: Text(_titles[currentIndex]),
         actions: [
+          if (activeFilter != null)
+            IconButton(
+              tooltip: 'Export CSV',
+              icon: const Icon(Icons.ios_share),
+              onPressed: () => exportTransactions(context, ref, activeFilter),
+            ),
           PopupMenuButton<_OverflowAction>(
             onSelected: (action) {
               switch (action) {
@@ -84,8 +108,6 @@ class _RootShell extends StatelessWidget {
                   context.push('/labels/categories');
                 case _OverflowAction.managePaymentMethods:
                   context.push('/labels/payment-methods');
-                case _OverflowAction.export:
-                  context.push('/export');
               }
             },
             itemBuilder: (context) => const [
@@ -97,54 +119,20 @@ class _RootShell extends StatelessWidget {
                 value: _OverflowAction.managePaymentMethods,
                 child: Text('Manage Payment Methods'),
               ),
-              PopupMenuItem(
-                value: _OverflowAction.export,
-                child: Text('Export'),
-              ),
             ],
           ),
         ],
       ),
       body: child,
-      floatingActionButton: isHistory
-          ? FloatingActionButton(
-              onPressed: () => context.push('/entry'),
-              child: const Icon(Icons.add),
-            )
-          : null,
       bottomNavigationBar: NavigationBar(
         selectedIndex: currentIndex,
         onDestinationSelected: (index) => context.go(_tabs[index]),
         destinations: const [
+          NavigationDestination(icon: Icon(Icons.add_circle_outline), label: 'Add'),
           NavigationDestination(icon: Icon(Icons.list), label: 'History'),
           NavigationDestination(icon: Icon(Icons.bar_chart), label: 'Analytics'),
         ],
       ),
-    );
-  }
-}
-
-class _PlaceholderScreen extends StatelessWidget {
-  const _PlaceholderScreen({required this.title});
-
-  final String title;
-
-  @override
-  Widget build(BuildContext context) {
-    return Center(child: Text(title));
-  }
-}
-
-class _PlaceholderPage extends StatelessWidget {
-  const _PlaceholderPage({required this.title});
-
-  final String title;
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: Text(title)),
-      body: Center(child: Text(title)),
     );
   }
 }

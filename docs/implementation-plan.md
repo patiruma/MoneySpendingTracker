@@ -11,8 +11,10 @@ become an automatic habit**. §8 already locked the framework to Flutter.
 
 The working directory currently contains only the spec — this is a greenfield build.
 
-**Environment verified:** Flutter 3.35.4 / Dart 3.9.2, Android SDK 36.1.0, Windows desktop
+**Environment verified:** Flutter 3.44.9 / Dart 3.12.2, Android SDK 36.1.0, Windows desktop
 (VS 2022), Chrome. No macOS toolchain on this machine.
+(Originally scaffolded on Flutter 3.35.4 / Dart 3.9.2; upgraded during Phase 2 so `drift_flutter`
+could move to the intended `^0.3.1`, which requires Dart ≥ 3.10.)
 
 **Decisions confirmed in planning** (resolving spec §7 and the §2.10 deferral):
 
@@ -249,6 +251,9 @@ Categories / Manage Payment Methods / Export.
 **Accept:** `flutter analyze` clean; app launches on Android emulator **and** Windows desktop; all
 nav destinations reachable with placeholder bodies.
 
+> **Amended in Phase 3:** the shell became bottom nav **Add | History | Analytics**, with Add as the
+> default tab and no FAB — see the Phase 3 brief below.
+
 ### Phase 1 — Data foundation (§2.2, §2.4, §2.10)
 
 **Preconditions:** Phase 0.
@@ -287,10 +292,19 @@ placeholder mutations throw.
 **Preconditions:** Phase 2 (needs `LabelPicker`, `confirmDialog`).
 **Create:** `lib/data/daos/transaction_dao.dart`, `lib/data/repositories/transaction_repository.dart`
 (upsert/delete only for now), `lib/features/entry/`.
-**Form:** amount (>0, `Money.tryParse`), date (defaults to now, freely editable to any date), category
-picker, payment-method picker, mandatory note, optional extra notes. Delete behind §3.1 confirmation.
+**Form, top to bottom:** amount (>0, `Money.tryParse`), payment-method picker, mandatory note,
+category picker, date (defaults to now, freely editable to any date), optional extra notes. Amount
+and payment method lead because those are the two things front-of-mind right after a purchase.
+Delete behind §3.1 confirmation.
+**Shell change:** `EntryScreen` gained an `embedded` flag and became the **Add** tab in the bottom
+nav — `Add | History | Analytics`, replacing the original FAB-on-History pattern from Phase 0.
+**Add is the default tab on launch**, since logging a transaction is the single most common action
+and §1's fast-path goal favors landing straight on it rather than one tap away. Editing an existing
+entry still routes through a separate pushed screen (`/entry/edit`, non-embedded, with the Delete
+action) since History doesn't have list items to tap into yet — that wiring lands in Phase 4.
 **Accept:** widget tests reject amount `0`, negative, and blank note; add → edit → delete round trip
-persists; editing any field of a past entry works (§2.3).
+persists; editing any field of a past entry works (§2.3); all three tabs (including Add) are
+reachable, and Add is the tab shown on launch.
 
 ### Phase 4 — History & needs-attention (§2.6, §2.7, §5)
 
@@ -327,14 +341,41 @@ automatically; line chart plots per-period totals, not a cumulative sum.
 single-category scope; bucket toggle re-buckets without refetching filters; a 5-day range defaults to
 Day buckets. **Load the `dataviz` skill before writing chart code.**
 
+> **As built.** Two provider details Phase 7 needs:
+> - **Analytics has its own filter**, `analyticsFilterProvider` — it is *not* shared with
+>   `historyFilterProvider`. The two views hold independent scope and range, so an export
+>   triggered from Analytics must read the analytics filter, and one from History the history
+>   filter. Exporting "the active filter" means *the calling view's* filter.
+> - **Bucket resolution is split in two.** `analyticsBucketOverrideProvider` (nullable) holds the
+>   user's explicit toggle; `analyticsBucketProvider` resolves it against the range-derived
+>   default. Read the latter, set the former. This is what makes "the manual toggle always wins"
+>   survive a later range change.
+>
+> Aggregation runs in Dart over the shared filtered query (see `watchSummary`), not a SQL
+> `GROUP BY` — bucketing is local-time/calendar-aware, and sharing one query is what makes the
+> total and the list beneath it structurally unable to disagree.
+
 ### Phase 7 — CSV export (§2.9)
 
 **Preconditions:** Phase 6 (so both call sites exist).
 **Create:** `lib/features/export/`.
 **Rules:** serialize from the caller's active `TransactionFilter` — no independent filter logic. Share
 sheet on mobile, save dialog on desktop. Amounts export as decimal strings, dates as ISO-8601 local.
+Use `Money.toDecimalString` (already built) for amounts — never format cents by hand, and never
+`Money.format`, which is locale-currency output for the UI, not CSV.
+**Which filter:** History and Analytics hold **separate** filter providers (see the Phase 6 "As
+built" note). Export from whichever view invoked it; there is no single global filter.
 **Accept:** exporting from a filtered view yields exactly that filtered set; exporting from an empty
 filtered view yields a header-only file, not all data.
+
+> **As built.** The original shell had a single global `/export` placeholder route reached from the
+> app-bar overflow menu — but that can't express "the invoking view's filter" (there is no global
+> filter, per the Phase 6 note above). Replaced with an **export icon button directly in the shell's
+> app bar**, shown only on the History and Analytics tabs, each reading that tab's own
+> `historyFilterProvider` / `analyticsFilterProvider`. The overflow menu now holds only the two
+> Manage entries. `lib/features/export/` holds `csv_export.dart` (pure serialization, unit-tested)
+> and `export_service.dart` (the platform hand-off); `export_action.dart` is the shared glue the two
+> screens' app-bar buttons call into.
 
 ### Phase 8 — Platform hardening (§2.10)
 
@@ -342,6 +383,75 @@ filtered view yields a header-only file, not all data.
 Windows desktop pass. Perf check against ~5k seeded rows (list scroll, analytics query). Manual-backup
 guidance in the README.
 → **Mac checkpoint #2** — full iOS pass, sideload / SideStore path per §8.
+
+**Carried-in findings** (observed during Phase 6, deliberately not fixed there):
+
+1. **`flutter build windows` can fail on missing `windows/flutter/ephemeral/` C++ wrapper files**
+   (`core_implementations.cc`, `standard_codec.cc`, …) with `error C1083: Cannot open source file`.
+   This is stale scaffold state, not a code defect — `flutter clean && flutter pub get` regenerates
+   them and the build succeeds. Don't go hunting in `windows/` for a real cause.
+2. **Analytics aggregates in Dart, not SQL.** Correct and deliberate for a personal dataset
+   (thousands of rows), but it is the one place that scales with row count rather than with what's
+   on screen. The ~5k-row perf check should measure the analytics query specifically; if it drags,
+   the fix is a SQL `GROUP BY` for the *totals only*, keeping local-time bucket boundaries computed
+   in Dart and passed in as range bounds.
+3. **`TransactionList` renders unvirtualized inside Analytics** (`shrinkWrap: true` +
+   `NeverScrollableScrollPhysics`, since it sits in an outer `ListView`). Every filtered row builds,
+   so a wide date range on a large dataset builds every tile. History is unaffected — it scrolls
+   normally and virtualizes. If the 5k-row check shows this, cap the analytics list (e.g. "showing
+   50 of N, view all in History") rather than un-nesting the scroll view.
+
+> **As built.**
+>
+> **The perf check found a hang, not a slowdown — and it was a correctness bug.**
+> `bucketEnd` advanced day/week buckets with `start.add(Duration(days: 1))`. On a DST *fall-back*
+> date the local day is 25 hours long, so that landed at 23:00 on the **same** date; `bucketStart`
+> then floored it straight back to the same midnight. `_fillGaps` steps
+> `cursor = bucketStart(bucketEnd(cursor))`, so the cursor stopped advancing and the loop appended
+> `BucketPoint`s forever. Any user whose Analytics range spanned a fall-back date with Day buckets
+> would hang the app — an unkillable spin, not a slow query. It went unnoticed until Phase 8
+> because every prior test used ranges of days-to-weeks that happened to miss the transition.
+>
+> Fixed by advancing with calendar arithmetic (`DateTime(y, m, d + 1)`), which normalizes overflow
+> and always lands on the next local midnight regardless of offset changes. `bucketStart`'s week
+> case had the same latent flaw (`subtract(Duration(days: diff))`) and got the same treatment.
+> `_fillGaps` now throws a `StateError` if a bucket step ever fails to advance — the guarantee is
+> cheap to assert and the cost of being wrong is an unkillable UI. Regression tests live in
+> `test/core/bucketing_test.dart` under `group('DST safety')`; they assert the always-advances
+> invariant, which holds in **every** timezone, so they stay meaningful on a runner with no DST.
+>
+> **Perf itself was a non-issue.** At 5k rows (`test/data/perf_test.dart`, tagged `perf`, seeded by
+> `test/data/seed_dataset.dart`): history query ~277ms, analytics combined/month ~446ms, analytics
+> rollup/day ~136ms, text search ~45ms, needs-attention filter ~14ms. Carried-in finding 2 (Dart
+> aggregation) needs no action — the SQL `GROUP BY` fallback stays unbuilt.
+>
+> **The perf assertions are ratios, not wall-clock budgets** — worth knowing before "fixing" them.
+> Absolute millisecond budgets were tried first and failed spuriously when the suite ran alongside
+> `flutter analyze` (the same query: 818ms contended, 524ms idle). A calibration against a *single-row*
+> lookup was tried next and was worse — a query returning no rows doesn't slow proportionally under
+> load, so the ratio swung 400x→1450x. What works is calibrating against a **bare 5000-row
+> `SELECT`**: both sides read the same rows, so contention scales them together. Verified stable
+> across idle and doubly-loaded runs (history 3.0–4.1x, rollup/day 2.1–2.8x). If these ever need
+> retuning, re-measure the ratio under load rather than raising a constant.
+>
+> **Carried-in finding 3 was fixed as prescribed.** `TransactionList` gained an opt-in `maxItems`
+> plus `overflowFooterBuilder`; Analytics passes 50 and a footer naming the true total. History
+> passes neither and is unchanged — it virtualizes, so capping it would only hide data. The total,
+> charts, and CSV export still read the full filtered set, so the headline can't disagree with what
+> the cap hides.
+>
+> **Carried-in finding 1 did not reproduce** — `flutter build windows` succeeded without needing
+> `flutter clean`. Kept in the README as a troubleshooting note.
+>
+> **Also fixed:** the desktop CSV path wrote `Uint8List.fromList(csv.codeUnits)`, truncating UTF-16
+> units to bytes and corrupting any non-ASCII note or label name. Now `utf8.encode`, with the
+> mobile path pinned to `encoding: utf8` too.
+>
+> **Backup guidance** landed in the README and the user guide. Worth recording: `drift_flutter`
+> 0.3.1 resolves `driftDatabase(name:)` via **`getApplicationDocumentsDirectory()`**, not app
+> support — so on Windows the file is `Documents\spending_tracker.sqlite` (verified on disk, not
+> assumed). That file-copy restore path exists only on desktop; on mobile it's in private app
+> storage, which is why CSV export is the answer there.
 
 ---
 
@@ -359,10 +469,17 @@ guidance in the README.
 ## 6. Verification
 
 - `flutter analyze` clean and `flutter test` green at every phase boundary.
+- `docs/user-guide.md` updated at every phase boundary: move the phase's features out of its
+  "Not built yet" table and document the real behaviour, limits included.
 - Repository tests run against an **in-memory drift DB** (`databaseProvider` overridden) — no mocks for
   DB behavior, since cascade/rollup/move correctness *is* SQL behavior.
-- `drift_dev schema dump` + generated migration tests from Phase 1 onward. The on-device DB is the
-  user's only copy — there is no server backup — which makes migration safety unusually important.
+- `drift_dev schema dump` + generated migration tests. The on-device DB is the user's only copy —
+  there is no server backup — which makes migration safety unusually important.
+  **Status:** the harness was actually built during Phase 2, not Phase 1 (`drift_schemas/`,
+  `test/data/generated_migrations/`, `test/data/migration_test.dart`). Nothing was missed in the
+  interim — Phase 2 added no schema changes, so the DB is still v1. See CLAUDE.md
+  "Schema migrations" for the per-change workflow. Note this needs `drift_dev` ≥ 2.34.5; 2.34.0
+  does not compile against `drift` 2.34.3.
 - End-to-end smoke per phase on Android emulator + Windows desktop; iOS at the two Mac checkpoints.
 
 ---
@@ -386,7 +503,7 @@ dependencies:
 
 dev_dependencies:
   flutter_test: {sdk: flutter}
-  drift_dev: ^2.28.0
+  drift_dev: ^2.34.5   # must be >= 2.34.5: 2.34.0 won't compile against drift 2.34.3
   build_runner: ^2.4.0
   flutter_lints: ^5.0.0
 ```
@@ -469,6 +586,7 @@ Stream<List<LabelNode>> watchTree(LabelKind kind);
 Future<List<Label>>     search(LabelKind kind, String query);
 Future<Label?>          findByName(LabelKind kind, String name, {String? parentId});
 Future<Label>           create({required LabelKind kind, required String name, String? parentId});
+Future<RenameImpact>    previewRename(String id);
 Future<void>            rename(String id, String newName);
 Future<MoveImpact>      previewMove(String id, String? newParentId);
 Future<void>            move(String id, String? newParentId);
@@ -488,21 +606,36 @@ Future<void>                        bulkReassign({required Set<String> ids,
 // models
 class DeleteImpact { final int descendantCount; final int affectedTransactionCount; }
 class MoveImpact   { final int subtreeCount; final bool valid; final String? reason; }
+class RenameImpact { final int affectedTransactionCount; }
 class AnalyticsSummary { final int totalCents; final List<BucketPoint> series;
                          final List<CategoryTotal> byCategory; }
 
-// providers — lib/shared/providers.dart + feature *_providers.dart
+// providers — all live in lib/shared/providers.dart (no feature-local provider
+// files were needed; keep new ones here so cross-feature reuse stays possible)
 databaseProvider · labelRepositoryProvider · transactionRepositoryProvider
 labelTreeProvider(LabelKind)                       // family
 historyFilterProvider · historyTransactionsProvider · historySelectionProvider
+historyVisibleSelectionProvider                    // selection ∩ visible rows; act on THIS
 analyticsFilterProvider · analyticsBucketProvider · analyticsSummaryProvider
+analyticsBucketOverrideProvider                    // nullable; user's explicit toggle
+analyticsTransactionsProvider                      // the §2.8.4 reused list
 ```
+
+Two additions beyond the original plan, both load-bearing:
+`historyVisibleSelectionProvider` (bulk writes must not touch rows the filter hides) and
+`analyticsBucketOverrideProvider` (separating the user's toggle from the resolved bucket is what
+lets "the manual toggle always wins" survive a later range change). Read
+`analyticsBucketProvider`, but write `analyticsBucketOverrideProvider`.
 
 ---
 
 ## 7. Draft `CLAUDE.md`
 
 Written to the repo root as `CLAUDE.md`. Reproduced here so this document stays self-contained.
+
+> **This is the original Phase-0 draft, kept for reference. `CLAUDE.md` at the repo root is the
+> live version and has since moved ahead of it** (toolchain versions, the `drift_dev` pin, and the
+> "Schema migrations" workflow added in Phase 2). Read the root file, not this copy.
 
 ````markdown
 # Personal Spending Tracker

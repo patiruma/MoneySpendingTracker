@@ -12,12 +12,28 @@ duplicate detection, no bank integration.
 `docs/implementation-plan.md` holds the data model, phase briefs, and the fixed name inventory
 (Appendix C) — consult it before inventing a repository method or provider name.
 
+`docs/user-guide.md` is the user-facing guide. It describes only what actually ships, and carries a
+"Not built yet" section listing the rest. **At the end of each phase, move that phase's features out
+of "Not built yet" and document the real behaviour** — including anything the app refuses to do, since
+the limits (3-level cap, cascade delete, placeholder immutability) are the least discoverable part.
+Update the status line and the README's phase status at the same time.
+
 Section numbers below refer to the spec.
 
 ## Stack
 
 drift + drift_flutter (SQLite) · Riverpod 2 (hand-written providers) · go_router · fl_chart ·
 csv + share_plus + path_provider + file_selector · uuid · intl
+
+Deps: see pubspec.yaml (Appendix A). Toolchain is Flutter 3.44.9 / Dart 3.12.2, so
+`drift_flutter` is on `^0.3.1` as the plan intended — the old `^0.2.8` pin is resolved and gone.
+Note that `sqlite3` 3.x now bundles the native library itself, which is why
+`sqlite3_flutter_libs` / `sqlcipher_flutter_libs` resolve to empty `+eol` shim packages. That is
+expected; don't try to "fix" it by pinning them back.
+
+`drift_dev` is pinned to `^2.34.5` deliberately: 2.34.0 does **not** compile against `drift` 2.34.3
+(its schema tooling references APIs that moved behind `drift3_preview`), which breaks every
+`drift_dev schema` command. If those commands start failing to build, check this pairing first.
 
 ## Locked decisions
 
@@ -37,6 +53,13 @@ csv + share_plus + path_provider + file_selector · uuid · intl
 - **Category rollup uses the recursive CTE** in `label_dao.dart`. Do not walk trees in Dart.
 - **`TransactionFilter` is the only filtering vocabulary.** History, Analytics, and CSV export all
   take one. Export has no filter logic of its own — that's what makes §2.9 true by construction.
+  **History and Analytics hold separate instances** (`historyFilterProvider` /
+  `analyticsFilterProvider`) so the two views scope independently. "Export respects the active
+  filter" therefore means *the invoking view's* filter — there is no global one to read.
+- **A bulk write only ever touches visible rows.** Selection state is reconciled against the
+  filtered list via `historyVisibleSelectionProvider`; act on that, never on the raw
+  `historySelectionProvider`. Narrowing a filter after selecting must not leave entries staged for
+  a write the user can no longer see.
 - **One Material 3 design across iOS and Android** (§2.10 decision). Adapt only where the platform
   genuinely differs: share sheet, date picker, back-swipe.
 - **Default date range is Last 30 days.** Analytics buckets are user-selectable Day/Week/Month,
@@ -76,19 +99,63 @@ iOS cannot be built on this Windows machine and Mac access is limited, so avoid 
 - UI reads DB state through drift `.watch()` streams behind a `StreamProvider`. Do not manually
   invalidate providers after a write; the stream handles it.
 - Filtered views show a true empty state — never silently fall back to unfiltered data (§5).
+- **Never step local calendar dates with `Duration`.** `add`/`subtract(Duration(days: n))` are
+  absolute-time operations; across a DST boundary they land at 23:00 or 01:00 on a neighbouring
+  date rather than local midnight. Use `DateTime(y, m, d + n)`, which normalizes overflow and
+  always lands on midnight. This is not hypothetical — `bucketEnd` did exactly this and hung the
+  app in an infinite loop for any Analytics range spanning a fall-back date (fixed in Phase 8; see
+  `group('DST safety')` in `test/core/bucketing_test.dart`).
 - Schema changes bump the drift schema version and add a migration test. The on-device DB is the
-  user's only copy; there is no backup to restore from.
-- Before writing chart code, load the `dataviz` skill.
+  user's only copy; there is no backup to restore from. The harness is live — see
+  **Schema migrations** below for the exact steps.
+- Before writing chart code, load the `dataviz` skill. Chart colors come from
+  `features/analytics/widgets/chart_palette.dart` (the skill's validated slot-1 blue plus chrome
+  inks, light and dark), **not** from the Material `ColorScheme` — scheme steps are tuned for UI
+  affordances, not the chart contrast floor. Both charts are deliberately single-hue: the category
+  breakdown is *nominal*, so bar length carries the magnitude and color is not spent re-encoding
+  it. Don't "improve" it into one hue per category — that breaks past 8 categories and fails the
+  skill's CVD checks.
+- After changing a chart, **render it and look at it** — the palette validator checks color, not
+  layout. Overlapping axis ticks and clipped labels only show up in a picture. A throwaway
+  `matchesGoldenFile` test with `--update-goldens` dumps a PNG; text renders as boxes without
+  fonts, which is fine for checking geometry. This is how the y-axis tick collision was caught.
 
 ## Commands
 
 ```
 flutter run -d windows            # fastest inner loop
 flutter run -d <android-device>
-dart run build_runner build --delete-conflicting-outputs   # after touching tables/ or database.dart
+dart run build_runner build        # after touching tables/ or database.dart
 flutter analyze
 flutter test
+flutter test --exclude-tags perf   # skip the ~5k-row benchmark for a fast loop
 ```
+
+(`--delete-conflicting-outputs` is gone in the current build_runner — it now warns and ignores it.)
+
+`test/data/perf_test.dart` (tag `perf`, seeded by `seed_dataset.dart`) is a real regression guard,
+not a microbenchmark — it is what caught the DST bucketing hang. Keep it in the default run; its
+timing budgets are deliberately loose.
+
+## Schema migrations
+
+Snapshots live in `drift_schemas/`, generated helpers in `test/data/generated_migrations/`
+(both checked in, both regenerated by command — never hand-edit). `test/data/migration_test.dart`
+asserts the live schema still matches the newest snapshot, so **editing `tables.dart` without
+re-dumping fails the suite** rather than silently drifting.
+
+When you change the schema:
+
+1. Bump `schemaVersion` in `database.dart` and add an `onUpgrade` step for the new version.
+2. `dart run build_runner build`
+3. `dart run drift_dev schema dump lib/data/database.dart drift_schemas/`
+4. `dart run drift_dev schema generate drift_schemas/ test/data/generated_migrations/`
+5. Add a test that seeds a database **at the old version**, runs `migrateAndValidate`, and asserts
+   the user's rows survived — not just that the shape is right. Shape-only tests pass while data
+   is being destroyed, and there is no backup to restore from.
+
+Verified end-to-end on an artificial v1→v2 column add: the harness passes a correct migration and
+fails a migration that forgets the column, reporting the missing column by name.
 
 ## Design north star
 

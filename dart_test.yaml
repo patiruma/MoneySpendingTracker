@@ -1,0 +1,11 @@
+# Declares the tags used in the suite so `flutter test` doesn't warn about them.
+#
+# `perf` marks the ~5k-row benchmark in test/data/perf_test.dart. It is part of
+# the normal suite (it catches real regressions — the DST hang in Analytics was
+# found by it), but it seeds thousands of rows per test, so it's tagged to keep
+# a fast inner loop available:
+#
+#   flutter test --exclude-tags perf
+tags:
+  perf:
+    description: Seeds a large dataset and measures query timings.
