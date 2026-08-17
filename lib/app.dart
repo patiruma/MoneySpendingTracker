@@ -9,6 +9,7 @@ import 'features/analytics/analytics_screen.dart';
 import 'features/entry/entry_screen.dart';
 import 'features/export/export_action.dart';
 import 'features/history/history_screen.dart';
+import 'features/import/import_action.dart';
 import 'features/labels/labels_screen.dart';
 import 'shared/providers.dart';
 import 'theme/theme.dart';
@@ -63,7 +64,7 @@ final GoRouter _router = GoRouter(
   ],
 );
 
-enum _OverflowAction { manageCategories, managePaymentMethods }
+enum _OverflowAction { importCsv, manageCategories, managePaymentMethods }
 
 class _RootShell extends ConsumerWidget {
   const _RootShell({required this.child});
@@ -104,6 +105,12 @@ class _RootShell extends ConsumerWidget {
           PopupMenuButton<_OverflowAction>(
             onSelected: (action) {
               switch (action) {
+                // Import takes no filter — a filter narrows what leaves the
+                // app, but there is nothing to narrow on the way in — so it
+                // lives in the global menu rather than beside the per-view
+                // export button.
+                case _OverflowAction.importCsv:
+                  importTransactions(context, ref);
                 case _OverflowAction.manageCategories:
                   context.push('/labels/categories');
                 case _OverflowAction.managePaymentMethods:
@@ -111,6 +118,10 @@ class _RootShell extends ConsumerWidget {
               }
             },
             itemBuilder: (context) => const [
+              PopupMenuItem(
+                value: _OverflowAction.importCsv,
+                child: Text('Import CSV'),
+              ),
               PopupMenuItem(
                 value: _OverflowAction.manageCategories,
                 child: Text('Manage Categories'),

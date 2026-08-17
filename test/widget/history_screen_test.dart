@@ -169,6 +169,116 @@ void main() {
     );
   });
 
+  testWidgets('the selection bar offers a delete action alongside Reassign', (tester) async {
+    await addTransaction(note: 'Entry one');
+    await pumpHistoryScreen(tester);
+
+    await tester.longPress(find.text('Entry one'));
+    await tester.pumpAndSettle();
+
+    expect(find.widgetWithText(FilledButton, 'Reassign'), findsOneWidget);
+    expect(find.byIcon(Icons.delete_outline), findsOneWidget);
+    expect(find.byTooltip('Delete 1 entry'), findsOneWidget);
+
+    await unmount(tester);
+  });
+
+  testWidgets('bulk delete removes the selected entries after confirming', (tester) async {
+    await addTransaction(note: 'Doomed one');
+    await addTransaction(note: 'Doomed two');
+    await pumpHistoryScreen(tester);
+
+    await tester.longPress(find.text('Doomed one'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(TextButton, 'Select all'));
+    await tester.pumpAndSettle();
+    expect(find.text('2 selected'), findsOneWidget);
+
+    await tester.tap(find.byIcon(Icons.delete_outline));
+    await tester.pumpAndSettle();
+
+    // §3.1: the dialog must state the exact count before anything is written.
+    expect(find.textContaining('Delete these 2 transactions?'), findsOneWidget);
+    await tester.tap(
+      find.descendant(
+        of: find.byType(AlertDialog),
+        matching: find.widgetWithText(FilledButton, 'Delete'),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Doomed one'), findsNothing);
+    expect(find.text('Doomed two'), findsNothing);
+    expect(find.text('No transactions match these filters.'), findsOneWidget);
+
+    await unmount(tester);
+  });
+
+  testWidgets('cancelling the delete confirmation keeps every entry', (tester) async {
+    await addTransaction(note: 'Entry one');
+    await addTransaction(note: 'Entry two');
+    await pumpHistoryScreen(tester);
+
+    await tester.longPress(find.text('Entry one'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byIcon(Icons.delete_outline));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(TextButton, 'Cancel'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Entry one'), findsOneWidget);
+    expect(find.text('Entry two'), findsOneWidget);
+    // Selection survives a cancel, so the user can act again without reselecting.
+    expect(find.text('1 selected'), findsOneWidget);
+
+    await unmount(tester);
+  });
+
+  testWidgets('bulk delete only touches the visible selection', (tester) async {
+    await addTransaction(note: 'Alpha');
+    await addTransaction(note: 'Beta');
+    await pumpHistoryScreen(tester);
+
+    await tester.longPress(find.text('Alpha'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(TextButton, 'Select all'));
+    await tester.pumpAndSettle();
+    expect(find.text('2 selected'), findsOneWidget);
+
+    // Narrow so only Alpha is visible. Beta must survive the delete even though
+    // it was selected before the filter changed.
+    await tester.tap(find.byIcon(Icons.close));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField).first, 'Alpha');
+    await tester.pumpAndSettle();
+
+    // Scope to the list: "Alpha" is now also the search field's contents.
+    final Finder alphaRow = find.descendant(
+      of: find.byType(ListTile),
+      matching: find.text('Alpha'),
+    );
+    await tester.longPress(alphaRow);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byIcon(Icons.delete_outline));
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.descendant(
+        of: find.byType(AlertDialog),
+        matching: find.widgetWithText(FilledButton, 'Delete'),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(alphaRow, findsNothing);
+
+    // Clear the search: Beta should still be there.
+    await tester.enterText(find.byType(TextField).first, '');
+    await tester.pumpAndSettle();
+    expect(find.text('Beta'), findsOneWidget);
+
+    await unmount(tester);
+  });
+
   testWidgets(
     'reassigning selected entries to a category clears the needs-attention flag',
     (tester) async {

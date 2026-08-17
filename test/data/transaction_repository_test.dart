@@ -1,8 +1,10 @@
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:money_spending_tracker/core/bucketing.dart';
 import 'package:money_spending_tracker/core/constants.dart';
 import 'package:money_spending_tracker/core/date_range.dart';
 import 'package:money_spending_tracker/data/database.dart';
+import 'package:money_spending_tracker/data/models/analytics_series.dart';
 import 'package:money_spending_tracker/data/models/transaction_draft.dart';
 import 'package:money_spending_tracker/data/models/transaction_filter.dart';
 import 'package:money_spending_tracker/data/models/transaction_with_labels.dart';
@@ -17,7 +19,7 @@ void main() {
 
   setUp(() {
     db = AppDatabase.forTesting(NativeDatabase.memory());
-    repo = TransactionRepository(db.transactionDao);
+    repo = TransactionRepository(db.transactionDao, db.importDao);
     labelRepo = LabelRepository(db.labelDao);
   });
 
@@ -305,6 +307,75 @@ void main() {
       await repo.bulkReassign(ids: <String>{}, categoryId: kNoCategoryId);
       // Should not throw, and should not touch anything.
       expect(await repo.listFiltered(TransactionFilter(range: DateRange.last30Days())), hasLength(1));
+    });
+  });
+
+  group('bulkDelete', () {
+    Future<void> addAt({required String note}) {
+      return repo.upsert(
+        TransactionDraft(
+          amountCents: 500,
+          occurredAt: DateTime.now().toUtc().millisecondsSinceEpoch,
+          categoryId: kNoCategoryId,
+          paymentMethodId: kNoPaymentMethodId,
+          note: note,
+        ),
+      );
+    }
+
+    Future<List<TransactionWithLabels>> live() =>
+        repo.listFiltered(TransactionFilter(range: DateRange.last30Days()));
+
+    test('deletes exactly the selected entries and leaves the rest', () async {
+      await addAt(note: 'Doomed one');
+      await addAt(note: 'Doomed two');
+      await addAt(note: 'Survivor');
+
+      final Set<String> doomed = (await live())
+          .where((TransactionWithLabels e) => e.transaction.note.startsWith('Doomed'))
+          .map((TransactionWithLabels e) => e.transaction.id)
+          .toSet();
+
+      await repo.bulkDelete(doomed);
+
+      final List<TransactionWithLabels> remaining = await live();
+      expect(remaining, hasLength(1));
+      expect(remaining.single.transaction.note, 'Survivor');
+    });
+
+    test('soft-deletes rather than removing rows', () async {
+      await addAt(note: 'Entry');
+      final String id = (await live()).single.transaction.id;
+
+      await repo.bulkDelete({id});
+
+      // The tombstone must survive — it is the sync marker, not an undo log.
+      final Transaction row =
+          (await (db.select(db.transactions)..where((t) => t.id.equals(id))).get()).single;
+      expect(row.deletedAt, isNotNull);
+      expect(await live(), isEmpty);
+    });
+
+    test('no-op for an empty id set', () async {
+      await addAt(note: 'Entry');
+      await repo.bulkDelete(<String>{});
+      expect(await live(), hasLength(1));
+    });
+
+    test('deleted entries drop out of analytics totals too', () async {
+      await addAt(note: 'Counted');
+      await addAt(note: 'Removed');
+      final Set<String> removed = (await live())
+          .where((TransactionWithLabels e) => e.transaction.note == 'Removed')
+          .map((TransactionWithLabels e) => e.transaction.id)
+          .toSet();
+
+      await repo.bulkDelete(removed);
+
+      final AnalyticsSummary summary = await repo
+          .watchSummary(TransactionFilter(range: DateRange.last30Days()), Bucket.day)
+          .first;
+      expect(summary.totalCents, 500);
     });
   });
 }

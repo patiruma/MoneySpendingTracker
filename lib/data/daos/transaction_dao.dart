@@ -270,6 +270,17 @@ SELECT id FROM subtree
     );
   }
 
+  /// Soft-deletes [ids] in one write — the bulk counterpart to [softDelete],
+  /// for the History selection bar. One statement rather than a loop, so a
+  /// partial failure can't leave half the selection deleted.
+  Future<void> bulkDelete(Set<String> ids) async {
+    if (ids.isEmpty) return;
+    final int now = _now;
+    await (update(transactions)..where((t) => t.id.isIn(ids))).write(
+      TransactionsCompanion(deletedAt: Value(now), updatedAt: Value(now)),
+    );
+  }
+
   /// Reassigns [ids] to [categoryId] and/or [paymentMethodId] in one write
   /// (§2.5). Either may be omitted to leave that field untouched, so callers
   /// can bulk-set just a category, just a payment method, or both.

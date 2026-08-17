@@ -1,7 +1,10 @@
 import '../../core/bucketing.dart';
+import '../../core/csv_import.dart';
+import '../daos/import_dao.dart';
 import '../daos/transaction_dao.dart';
 import '../database.dart';
 import '../models/analytics_series.dart';
+import '../models/import_plan.dart';
 import '../models/transaction_draft.dart';
 import '../models/transaction_filter.dart';
 import '../models/transaction_with_labels.dart';
@@ -9,9 +12,10 @@ import '../models/transaction_with_labels.dart';
 /// Transaction reads/writes (§2.2, §2.3, §2.7) and analytics aggregation
 /// (§2.8). Export lands in Phase 7.
 class TransactionRepository {
-  TransactionRepository(this._dao);
+  TransactionRepository(this._dao, this._importDao);
 
   final TransactionDao _dao;
+  final ImportDao _importDao;
 
   Future<Transaction?> findById(String id) => _dao.findById(id);
 
@@ -42,4 +46,22 @@ class TransactionRepository {
     String? categoryId,
     String? paymentMethodId,
   }) => _dao.bulkReassign(ids: ids, categoryId: categoryId, paymentMethodId: paymentMethodId);
+
+  /// Soft-deletes [ids] in one atomic write. Behind a confirmation in the UI
+  /// (§2.3 requires one for a single entry; a bulk delete needs it more), and
+  /// acting only on the *visible* selection — see
+  /// `historyVisibleSelectionProvider`.
+  Future<void> bulkDelete(Set<String> ids) => _dao.bulkDelete(ids);
+
+  /// Resolves parsed CSV rows against the database without writing anything —
+  /// which labels are missing, which rows already exist. The confirmation and
+  /// the per-duplicate prompts both run off this.
+  Future<ImportPlan> planImport(ImportParseResult parsed) => _importDao.plan(parsed);
+
+  /// Commits a planned import in one atomic write, applying the user's
+  /// per-duplicate [choices] (keyed by source line number).
+  Future<ImportResult> commitImport(
+    ImportPlan plan,
+    Map<int, DuplicateChoice> choices,
+  ) => _importDao.commit(plan, choices);
 }

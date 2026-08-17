@@ -9,3 +9,18 @@
 tags:
   perf:
     description: Seeds a large dataset and measures query timings.
+
+  # `golden` renders the charts to PNGs so their *layout* can be eyeballed —
+  # the palette validator checks color, and only a picture catches overlapping
+  # axis ticks or a clipped label (which is exactly how the phone-width date
+  # label collision was found).
+  #
+  # Skipped by default: golden bytes depend on the host's font rasterization,
+  # so they'd fail spuriously anywhere but the machine that generated them.
+  # They are a visual aid, not a gate — the real assertions live in
+  # test/widget/spending_line_chart_test.dart. To regenerate and look:
+  #
+  #   flutter test test/widget/chart_golden_test.dart --update-goldens --tags golden
+  golden:
+    description: Renders charts to PNGs for manual layout inspection.
+    skip: "Visual aid; run explicitly with --tags golden."

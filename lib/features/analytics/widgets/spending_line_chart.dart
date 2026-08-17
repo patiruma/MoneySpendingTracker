@@ -28,21 +28,49 @@ class SpendingLineChart extends StatelessWidget {
         Theme.of(context).textTheme.bodySmall?.copyWith(color: palette.mutedInk) ??
         TextStyle(color: palette.mutedInk, fontSize: 12);
 
-    final int maxCents = series.fold<int>(
+    // The chart's vertical scale is in **dollars**, because that is the unit
+    // the spots below are plotted in (`totalCents / 100`). Every value that
+    // meets fl_chart — maxY, the gridline interval, the tick values handed to
+    // the label formatter — has to be in that same unit. Mixing the two (axis
+    // in cents, spots in dollars) puts a $25 point on a 0–2500 axis, pinning it
+    // flat to the baseline while the ticks read $0–$20.
+    final double maxDollars = series.fold<double>(
       0,
-      (int acc, BucketPoint p) => p.totalCents > acc ? p.totalCents : acc,
+      (double acc, BucketPoint p) => p.totalCents / 100 > acc ? p.totalCents / 100 : acc,
     );
     // Round the axis top up to a clean tick so labels read as round numbers
     // ($0 / $500 / $1,000) instead of arbitrary fractions of the maximum —
     // which is also what stops adjacent ticks rendering as near-identical
     // compact strings ("$1.2K" above "$1.3K").
-    final double horizontalInterval = _niceInterval(maxCents);
-    final double maxY = maxCents == 0
+    final double horizontalInterval = _niceInterval(maxDollars);
+    final double maxY = maxDollars == 0
         // A flat-zero range would collapse the vertical scale; give it a
         // nominal head so the baseline still renders as a chart.
         ? horizontalInterval * 4
-        : (maxCents / horizontalInterval).ceil() * horizontalInterval;
+        : (maxDollars / horizontalInterval).ceil() * horizontalInterval;
 
+    // Date labels are thinned against the *actual* plot width, not a fixed
+    // count: six labels fit comfortably on a tablet and collide into a solid
+    // run of text on a phone. Measured, because the palette validator checks
+    // color and only a picture catches a collision.
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        final double plotWidth = constraints.maxWidth - _yAxisGutter;
+        final int labelInterval = _labelIntervalFor(plotWidth);
+
+        return _build(context, palette, tickStyle, horizontalInterval, maxY, labelInterval);
+      },
+    );
+  }
+
+  Widget _build(
+    BuildContext context,
+    ChartPalette palette,
+    TextStyle tickStyle,
+    double horizontalInterval,
+    double maxY,
+    int labelInterval,
+  ) {
     return LineChart(
       LineChartData(
         minY: 0,
@@ -64,7 +92,7 @@ class SpendingLineChart extends StatelessWidget {
           leftTitles: AxisTitles(
             sideTitles: SideTitles(
               showTitles: true,
-              reservedSize: 52,
+              reservedSize: _yAxisGutter,
               interval: horizontalInterval,
               getTitlesWidget: (double value, TitleMeta meta) {
                 // Ticks now land on round values, so every one is worth
@@ -76,7 +104,7 @@ class SpendingLineChart extends StatelessWidget {
                 return Padding(
                   padding: const EdgeInsets.only(right: 6),
                   child: Text(
-                    _compactCents(value.round()),
+                    _compactDollars(value),
                     style: tickStyle,
                     textAlign: TextAlign.right,
                   ),
@@ -90,13 +118,13 @@ class SpendingLineChart extends StatelessWidget {
               reservedSize: 28,
               // Thin the ticks so labels never collide on a long range;
               // the tooltip carries every point's exact date.
-              interval: _labelInterval.toDouble(),
+              interval: labelInterval.toDouble(),
               getTitlesWidget: (double value, TitleMeta meta) {
                 final int index = value.round();
                 if (index < 0 || index >= series.length) {
                   return const SizedBox.shrink();
                 }
-                if (index % _labelInterval != 0) return const SizedBox.shrink();
+                if (index % labelInterval != 0) return const SizedBox.shrink();
                 return Padding(
                   padding: const EdgeInsets.only(top: 6),
                   child: Text(_axisLabel(series[index].start), style: tickStyle),
@@ -157,10 +185,10 @@ class SpendingLineChart extends StatelessWidget {
 
   /// Picks a round gridline step (1/2/5 × a power of ten) targeting ~4 ticks,
   /// so the y-axis reads as clean numbers rather than fractions of the data's
-  /// maximum. Works in cents throughout; the label formatter converts.
-  static double _niceInterval(int maxCents) {
-    if (maxCents <= 0) return 100;
-    final double rough = maxCents / 4;
+  /// maximum. Works in **dollars**, the same unit as the plotted spots.
+  static double _niceInterval(double maxDollars) {
+    if (maxDollars <= 0) return 1;
+    final double rough = maxDollars / 4;
     final double magnitude = math.pow(10, (math.log(rough) / math.ln10).floor()).toDouble();
     for (final double step in <double>[1, 2, 5, 10]) {
       final double candidate = step * magnitude;
@@ -169,8 +197,23 @@ class SpendingLineChart extends StatelessWidget {
     return 10 * magnitude;
   }
 
-  /// Show at most ~6 date labels regardless of how many buckets there are.
-  int get _labelInterval => series.length <= 6 ? 1 : (series.length / 6).ceil();
+  /// Width reserved for the y-axis labels — mirrors `reservedSize` below.
+  static const double _yAxisGutter = 52;
+
+  /// Roughly the widest a date tick gets ("12/31"), plus breathing room. Two
+  /// labels closer than this read as one smear.
+  static const double _minLabelSpacing = 56;
+
+  /// Keeps every date label at least [_minLabelSpacing] apart by dropping every
+  /// nth bucket, so a 30-day range on a phone shows ~5 labels instead of six
+  /// overlapping ones. The tooltip still carries every point's exact date, so
+  /// thinning costs nothing.
+  int _labelIntervalFor(double plotWidth) {
+    if (series.length <= 1 || plotWidth <= 0) return 1;
+    final int maxLabels = math.max(2, plotWidth ~/ _minLabelSpacing);
+    if (series.length <= maxLabels) return 1;
+    return (series.length / maxLabels).ceil();
+  }
 
   String _axisLabel(DateTime start) {
     switch (bucket) {
@@ -195,11 +238,15 @@ class SpendingLineChart extends StatelessWidget {
   }
 
   /// Axis ticks are compact so they stay short: $1.2K rather than $1,234.00.
-  static String _compactCents(int cents) {
-    final double units = cents / 100;
-    if (units >= 1000) {
-      return NumberFormat.compactSimpleCurrency().format(units);
+  /// Takes **dollars** — the axis unit.
+  ///
+  /// Sub-dollar steps keep their cents, so a tiny range doesn't render every
+  /// tick as an identical "$0".
+  static String _compactDollars(double dollars) {
+    if (dollars >= 1000) {
+      return NumberFormat.compactSimpleCurrency().format(dollars);
     }
-    return NumberFormat.simpleCurrency(decimalDigits: 0).format(units);
+    final int decimals = dollars > 0 && dollars < 1 ? 2 : 0;
+    return NumberFormat.simpleCurrency(decimalDigits: decimals).format(dollars);
   }
 }

@@ -68,51 +68,88 @@ Future<void> blockedDialog(
 /// Prompts for a single line of text (new name, new label name).
 /// Returns null when cancelled. Confirmation of the *impact* happens separately
 /// — this only collects the input.
+///
+/// The controller is owned by [_NamePromptDialog], **not** by this function.
+/// Disposing it here — in a `finally` after the `await` — tears it down while
+/// the dialog route's exit transition is still animating the field, which
+/// rebuilds a `TextFormField` around a dead controller and trips
+/// `_dependents.isEmpty` / "used after being disposed". Tying the controller's
+/// lifetime to the widget's `State` is what makes the teardown ordering correct.
 Future<String?> promptForName(
   BuildContext context, {
   required String title,
   String? initialValue,
   String label = 'Name',
   String confirmLabel = 'Next',
-}) async {
-  final TextEditingController controller = TextEditingController(text: initialValue);
-  final GlobalKey<FormState> formKey = GlobalKey<FormState>();
+}) {
+  return showDialog<String>(
+    context: context,
+    builder: (BuildContext dialogContext) => _NamePromptDialog(
+      title: title,
+      initialValue: initialValue,
+      label: label,
+      confirmLabel: confirmLabel,
+    ),
+  );
+}
 
-  try {
-    return await showDialog<String>(
-      context: context,
-      builder: (BuildContext dialogContext) {
-        void submit() {
-          if (formKey.currentState?.validate() ?? false) {
-            Navigator.of(dialogContext).pop(controller.text.trim());
-          }
-        }
+class _NamePromptDialog extends StatefulWidget {
+  const _NamePromptDialog({
+    required this.title,
+    required this.initialValue,
+    required this.label,
+    required this.confirmLabel,
+  });
 
-        return AlertDialog(
-          title: Text(title),
-          content: Form(
-            key: formKey,
-            child: TextFormField(
-              controller: controller,
-              autofocus: true,
-              textCapitalization: TextCapitalization.sentences,
-              decoration: InputDecoration(labelText: label),
-              validator: (String? value) =>
-                  (value == null || value.trim().isEmpty) ? 'Enter a name' : null,
-              onFieldSubmitted: (_) => submit(),
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(dialogContext).pop(),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(onPressed: submit, child: Text(confirmLabel)),
-          ],
-        );
-      },
+  final String title;
+  final String? initialValue;
+  final String label;
+  final String confirmLabel;
+
+  @override
+  State<_NamePromptDialog> createState() => _NamePromptDialogState();
+}
+
+class _NamePromptDialogState extends State<_NamePromptDialog> {
+  late final TextEditingController _controller =
+      TextEditingController(text: widget.initialValue);
+  final GlobalKey<FormState> _formKey = GlobalKey<FormState>();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    if (_formKey.currentState?.validate() ?? false) {
+      Navigator.of(context).pop(_controller.text.trim());
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(widget.title),
+      content: Form(
+        key: _formKey,
+        child: TextFormField(
+          controller: _controller,
+          autofocus: true,
+          textCapitalization: TextCapitalization.sentences,
+          decoration: InputDecoration(labelText: widget.label),
+          validator: (String? value) =>
+              (value == null || value.trim().isEmpty) ? 'Enter a name' : null,
+          onFieldSubmitted: (_) => _submit(),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(onPressed: _submit, child: Text(widget.confirmLabel)),
+      ],
     );
-  } finally {
-    controller.dispose();
   }
 }

@@ -18,7 +18,7 @@ void main() {
 
   setUp(() {
     db = AppDatabase.forTesting(NativeDatabase.memory());
-    repo = TransactionRepository(db.transactionDao);
+    repo = TransactionRepository(db.transactionDao, db.importDao);
     labelRepo = LabelRepository(db.labelDao);
   });
 

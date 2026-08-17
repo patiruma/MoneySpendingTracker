@@ -175,7 +175,8 @@ money_spending_tracker/
 │  │  ├─ history/                    # §2.5–2.7
 │  │  ├─ analytics/                  # §2.8
 │  │  ├─ labels/                     # §2.4
-│  │  └─ export/                     # §2.9
+│  │  ├─ export/                     # §2.9
+│  │  └─ import/                     # Phase 9, post-v1 (parser lives in core/)
 │  ├─ shared/
 │  │  ├─ providers.dart              # database + repository providers (overridden in tests)
 │  │  └─ widgets/
@@ -235,6 +236,7 @@ Phase 2 precedes Phase 3 because the entry form depends on the label picker.
 | 6 | Analytics | **Opus, medium** | Rollup + bucketing correctness. Charts alone would be Sonnet, but they share a session with the aggregation layer. |
 | 7 | CSV export | **Sonnet, low** | Mechanical, and the filter logic is already built. |
 | 8 | Platform hardening | **Opus, medium** | Open-ended platform debugging; poor fit for a cheap tier. |
+| 9 | CSV import | **Opus, medium** | Added after v1, not in the spec. Label resolution and duplicate matching both have quiet failure modes that only show up on a second import. |
 
 Fast mode is fine throughout — it doesn't downgrade the model.
 
@@ -453,6 +455,65 @@ guidance in the README.
 > assumed). That file-copy restore path exists only on desktop; on mobile it's in private app
 > storage, which is why CSV export is the answer there.
 
+### Phase 9 — CSV import (post-v1 addition)
+
+**Not in the spec.** §2.9 asks only for export; import was requested afterwards, and the spec is
+locked, so this is recorded as a deliberate addition rather than a reinterpretation. It does not
+touch any §6 non-goal except duplicate detection, discussed below.
+
+**Preconditions:** Phase 7 (the export format is the import format).
+**Create:** `lib/core/csv_import.dart` (pure parser), `lib/data/models/import_plan.dart`,
+`lib/data/daos/import_dao.dart`, `lib/features/import/`
+(`import_service.dart`, `duplicate_dialog.dart`, `import_action.dart`).
+
+**Shape of the feature.** Import is **preview-then-commit**: parse → resolve against the DB →
+confirm with real counts → answer every duplicate → one atomic write. Nothing is written until the
+user has seen the counts, and a failure rolls back rows *and* the labels created for them.
+
+**What the export format cannot carry**, which defines the feature's limits:
+
+- **No transaction id.** An imported row is always a new row; identity-based dedup is impossible.
+- **No label path.** Export writes a label's own name, so `Food > Restaurants` exports as
+  `Restaurants`. Missing labels are therefore created **top-level**, matching the entry picker's
+  fast path; nesting is rebuilt via `move` on the manage screen. An ambiguous name (same name under
+  two parents) resolves shallowest-first, then by id, so resolution is deterministic.
+
+**Duplicate detection — a deliberate, scoped exception to §6.** §6 rules out automatically
+detecting duplicates. That guardrail is about the *entry* path: the app must not second-guess the
+user as they log purchases. On the import path, the absence of any check means re-importing a file
+silently doubles the user's history — so import compares **every field the CSV carries**
+(occurred-at millis, amount cents, category name, payment method name, note, extra notes) and
+prompts per match. Time is part of the key on purpose: two identical purchases on the same day are
+real and must stay distinct. Nothing about the entry path changed.
+
+The prompt is modelled on a file-copy conflict: **Keep both / Replace / Skip / Cancel import**, with
+a "do this for the remaining N" checkbox. An unanswered duplicate defaults to keep-both — the
+choice that never loses data.
+
+**Blank label cells resolve to the placeholder** and import flagged as needs-attention (§2.6).
+This is subtle enough to have been a real bug: the stored row reads `No Category` while the
+incoming cell is `''`, so matching on raw text re-imported the row as new on every pass and an
+export/import loop grew without bound. Matching compares the name the row *resolves to*. Regression
+tests: `group('duplicate detection')` in `test/data/import_test.dart`.
+
+**No filter.** Import takes no `TransactionFilter` — a filter narrows what leaves the app, and
+there is nothing to narrow on the way in. It therefore lives in the **overflow menu**, global, not
+beside the per-view export icon.
+
+**No schema change.** `ImportDao` is a new accessor over the existing tables; `schemaVersion` stays
+at 1 and the migration harness is untouched.
+
+**iOS-clean.** Reading goes through `file_selector`'s `openFile` on every platform — the share
+sheet exists because iOS gives an app nowhere to *write*, which doesn't apply to reading. A UTF-8
+BOM is stripped so a file round-tripped through Excel still passes the header check.
+
+**Accept:** parser rejects a non-export header; a bad row is skipped with its line number while
+good rows import; a re-imported export reports every row as a duplicate and skip-all is a no-op;
+label names match case-insensitively and are created once per file; a failed commit leaves no rows
+**and** no labels. Covered by `test/core/csv_import_test.dart` (18),
+`test/data/import_test.dart` (28), `test/widget/duplicate_dialog_test.dart`,
+`test/widget/import_action_test.dart`.
+
 ---
 
 ## 5. Remaining Assumptions
@@ -602,6 +663,17 @@ Future<void>                        upsert(TransactionDraft d);
 Future<void>                        delete(String id);
 Future<void>                        bulkReassign({required Set<String> ids,
                                                   String? categoryId, String? paymentMethodId});
+Future<void>                        bulkDelete(Set<String> ids);
+Future<ImportPlan>                  planImport(ImportParseResult parsed);      // read-only
+Future<ImportResult>                commitImport(ImportPlan p,
+                                                 Map<int, DuplicateChoice> choices);
+
+// lib/core/csv_import.dart — pure, no Flutter/DB
+CsvImport.parse(String csv) -> ImportParseResult   // throws ImportFormatException
+class ImportRow    { lineNumber, occurredAt, amountCents, categoryName,
+                     paymentMethodName, note, extraNotes }
+class ImportRowError     { final int lineNumber; final String message; }
+class ImportParseResult  { final List<ImportRow> rows; final List<ImportRowError> errors; }
 
 // models
 class DeleteImpact { final int descendantCount; final int affectedTransactionCount; }
@@ -609,6 +681,13 @@ class MoveImpact   { final int subtreeCount; final bool valid; final String? rea
 class RenameImpact { final int affectedTransactionCount; }
 class AnalyticsSummary { final int totalCents; final List<BucketPoint> series;
                          final List<CategoryTotal> byCategory; }
+enum  DuplicateChoice  { keepBoth, skip, replace }
+class DuplicateCandidate { final ImportRow row; final Transaction existing; }
+class ImportPlan   { final List<ImportRow> newRows; final List<DuplicateCandidate> duplicates;
+                     final List<ImportRowError> errors;
+                     final Set<String> newCategoryNames, newPaymentMethodNames; }
+class ImportResult { final int inserted, replaced, skipped, labelsCreated;
+                     final List<ImportRowError> errors; }
 
 // providers — all live in lib/shared/providers.dart (no feature-local provider
 // files were needed; keep new ones here so cross-feature reuse stays possible)

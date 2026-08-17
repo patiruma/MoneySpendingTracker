@@ -51,11 +51,6 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
 
-  # The "flutter_lints" package below contains a set of recommended lints to
-  # encourage good coding practices. The lint set provided by the package is
-  # activated in the `analysis_options.yaml` file located at the root of your
-  # package. See that file for information about deactivating specific lint
-  # rules and activating additional ones.
   flutter_lints: ^5.0.0
   drift_dev: ^2.34.5
   build_runner: ^2.4.0
@@ -107,8 +102,8 @@ flutter_launcher_icons:
   android: true
   ios: true
   remove_alpha_ios: true
-  image_path: "assets/icon/app_icon.png"
+  image_path: "icon-2a-green-dollar.png"
   windows:
     generate: true
-    image_path: "assets/icon/app_icon.png"
+    image_path: "icon-2a-green-dollar.png"
     icon_size: 256

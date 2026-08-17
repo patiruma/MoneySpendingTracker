@@ -6,8 +6,8 @@ no accounts, no server, no sync.
 **Status:** Phases 0–8 complete — feature-complete for v1 on Android and Windows (scaffold, data
 foundation, Categories & Payment Methods, transaction entry/edit/delete, History with filtering
 and needs-attention flagging, bulk recategorization, Analytics with rollup totals and charts, CSV
-export, and platform hardening). The remaining work is the iOS pass, which needs Mac access —
-see [Platform status](#platform-status).
+export, and platform hardening), plus **CSV import** added afterwards. The remaining work is the
+iOS pass, which needs Mac access — see [Platform status](#platform-status).
 
 ## Documentation
 
@@ -65,9 +65,14 @@ first and clear the category, payment-method, and search filters. On Windows you
 location; on Android/iOS it goes through the share sheet.
 
 CSV is readable anywhere (Excel, Sheets, any text editor) and is written as UTF-8, so accented
-characters and emoji in notes survive intact. Note that it is a **data export, not a restorable
-backup** — there is no CSV import, so restoring means re-entering. Its value is that your records
-survive even if the app doesn't.
+characters and emoji in notes survive intact.
+
+**Import CSV** (overflow menu, ⋮) reads those files back, so an export is a real restore path.
+Import previews before writing, commits atomically, and prompts per exact-duplicate row with
+keep-both / replace / skip and an "apply to the rest" option. The one thing it cannot restore is
+label **nesting** — the format stores a label's own name, not its path, so a restored
+`Food > Restaurants` comes back as a top-level `Restaurants` and the tree is rebuilt with **Move**
+on the manage screen.
 
 ### 2. Copying the database file (a true snapshot)
 

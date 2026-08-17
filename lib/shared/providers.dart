@@ -25,7 +25,8 @@ final Provider<LabelRepository> labelRepositoryProvider = Provider<LabelReposito
 
 final Provider<TransactionRepository> transactionRepositoryProvider =
     Provider<TransactionRepository>((ref) {
-      return TransactionRepository(ref.watch(databaseProvider).transactionDao);
+      final AppDatabase db = ref.watch(databaseProvider);
+      return TransactionRepository(db.transactionDao, db.importDao);
     });
 
 /// The label tree for one kind, live. Backed by drift's `watch()`, so writes

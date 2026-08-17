@@ -4,8 +4,8 @@ A personal expense tracker that runs entirely on your device. No account, no sig
 Your data never leaves your phone or computer.
 
 > **Status: feature-complete for v1** on Android and Windows. Everything described below works
-> today; the only outstanding work is an iOS pass, which needs a Mac. Last updated at the end of
-> Phase 8 (platform hardening).
+> today; the only outstanding work is an iOS pass, which needs a Mac. Last updated when **CSV
+> import** was added after Phase 8.
 
 ---
 
@@ -166,26 +166,32 @@ The short version: the Manage screen changes *what a label is called*. Editing a
 
 ---
 
-## Bulk recategorizing entries
+## Bulk recategorizing and deleting entries
 
 From **History**, long-press any entry to enter selection mode, right there in the list — there's
 no separate screen for this. The filter bar is replaced by a selection bar showing how many
-entries are selected, with three actions:
+entries are selected, with four actions:
 
 - **✕** — clears the selection and returns to the normal filtered view.
 - **Select all** — selects every entry currently matching your active filters (not necessarily
   everything in your history — whatever the list is showing at the time).
+- **🗑 Delete** — deletes every selected entry at once, after a confirmation naming the exact
+  count. This one cannot be undone.
 - **Reassign** — opens a sheet to pick a new Category and/or new Payment Method. Leaving either
   one unset keeps that field as-is on every selected entry; setting both changes both.
 
 Tapping any entry while in selection mode toggles it in or out of the selection, instead of
-opening it for editing. After choosing what to reassign to, you'll see a confirmation stating how
-many entries are affected before anything is written — reassignment is a bulk write, so it goes
-through the same confirmation policy as other structural changes.
+opening it for editing. Both bulk actions confirm first, stating how many entries are affected
+before anything is written.
+
+Both act on **what you can currently see**. If you select entries and then narrow the filter, the
+ones that dropped out of the list are no longer part of the selection — a bulk write never touches
+an entry you can't see.
 
 A common flow: tap the **Needs attention** chip to filter down to "No Category" entries, long-press
 one, **Select all**, then **Reassign** them to their real category in one action. Once reassigned,
-they no longer match the "Needs attention" filter and drop out of that view immediately.
+they no longer match the "Needs attention" filter and drop out of that view immediately. The same
+route works for clearing out entries you no longer want — filter, **Select all**, **Delete**.
 
 ---
 
@@ -303,8 +309,8 @@ to find something to display.
 Every action that creates, renames, moves, or deletes a **label** asks first, and tells you the
 consequences in real numbers — how many entries a rename touches, how many sub-items a delete takes
 with it, how many entries will fall back to "No Category". Deleting a **transaction** also asks
-first, with a plain "Delete this transaction?" prompt. Bulk-reassigning entries in History asks
-too, stating how many entries will be affected.
+first, with a plain "Delete this transaction?" prompt. Bulk-reassigning and bulk-deleting entries
+in History ask too, stating how many entries will be affected.
 
 Logging or editing a transaction's fields is deliberately **not** behind a confirmation. Day-to-day
 entry is meant to be fast; only irreversible or structural changes are worth an extra tap.
@@ -329,8 +335,8 @@ Two things worth knowing:
 - **Export honours the current filters**, so to capture *everything* you must first widen the date
   range and clear the category, payment method, and search filters. Exporting from a narrowed view
   backs up only that slice — quietly, since a small file looks like a successful export.
-- **There's no import.** CSV is a readable record, not a restore button; recovering from it means
-  re-entering the data. It guarantees your history survives, not that the app can rebuild itself.
+- **Import reads those files back** (see below), so an export is a genuine restore path, not just a
+  readable record. What it can't restore is label *nesting* — see the import section for why.
 
 On **Windows** there's a stronger option: the entire database is one file at
 `Documents\spending_tracker.sqlite`. Copy it while the app is closed and you have a complete
@@ -364,12 +370,86 @@ failure or a crash.
 
 ---
 
+## Importing from CSV
+
+**Import CSV** lives in the overflow menu (⋮) in the top app bar, on every tab. It reads files in
+exactly the shape export produces, so the pair works as a backup-and-restore path: export your
+history, and you can load it back onto a fresh install or a new device.
+
+Unlike export, import has no filter — a filter narrows what leaves the app, but there's nothing to
+narrow on the way in. That's why it sits in the menu rather than next to the export icon.
+
+### Nothing is written until you say so
+
+Import always previews first. Pick a file and you get a confirmation stating exactly what will
+happen: how many new entries, how many already exist, how many categories and payment methods
+would be created, and how many rows couldn't be read. Cancel and nothing has changed.
+
+The write itself is all-or-nothing. If anything fails partway, the whole import rolls back — you
+won't be left with half your entries and a handful of new empty categories.
+
+### Categories and payment methods
+
+Names in the file are matched against your existing labels, ignoring case, so `FOOD` finds your
+`Food`. Anything that doesn't exist is **created at the top level**, and the confirmation tells you
+how many before it happens.
+
+Two limits worth knowing, both of which come from what the CSV format carries:
+
+- **Nesting isn't restored.** Export writes a label's own name, not its full path, so
+  `Food > Restaurants` exports as just `Restaurants` and comes back as a top-level category. Your
+  entries are all there and correctly labelled — the tree structure isn't. Rebuild it on the manage
+  screen with **Move**, which leaves every past entry pointing where it already points.
+- **A repeated name is ambiguous.** If you have `Restaurants` under both `Food` and `Travel`, the
+  file can't say which one a row meant. Import picks the top-level one, or the shallowest available.
+
+A blank Category or Payment Method cell imports as **No Category** / **No Payment Method**, flagged
+as needing attention — the same as if the label had been deleted. Filter History to those and
+bulk-recategorize them.
+
+### When an entry already exists
+
+Import can't tell an already-imported row from a new one by identity — the CSV carries no hidden
+id. Instead it compares **every field**: date and time, amount, category, payment method, note, and
+additional notes. All six must match for a row to count as a duplicate. Time is part of that on
+purpose, so two genuinely separate purchases of the same thing on the same day stay separate.
+
+For each duplicate you get a prompt showing the entry, with four choices:
+
+| Choice | What happens |
+| --- | --- |
+| **Keep both** | Imports it as a second, separate entry. |
+| **Replace** | Overwrites the existing entry instead of adding one. |
+| **Skip** | Leaves your existing entry alone and drops the incoming row. |
+| **Cancel import** | Abandons the whole import. Nothing is written — including the rows you already answered for. |
+
+Tick **"Do this for the remaining N"** to apply your answer to every duplicate left in the file,
+rather than answering one at a time.
+
+Re-importing a file you've already imported and choosing **Skip** for everything is therefore a
+safe no-op — useful if you're not sure whether a file already went in.
+
+### Rows that can't be read
+
+A single bad row doesn't cost you the rest of the file. Rows are skipped individually, with the
+line number and reason shown in the confirmation, when:
+
+- the amount is zero, negative, or not a number (entries must be greater than zero)
+- the note is blank (it's a required field)
+- the date can't be parsed
+- the row has too few columns
+
+If the file isn't a spending export at all — wrong or missing header — import stops and tells you,
+rather than guessing at the columns.
+
+---
+
 ## Platform support
 
 | Platform | State |
 | --- | --- |
 | **Android** | Works. |
-| **Windows** | Works. Export opens a save dialog, and the database file is reachable for backups (above). |
+| **Windows** | Works. Export opens a save dialog, import opens a file picker, and the database file is reachable for backups (above). |
 | **iOS** | Built to run there — nothing in the app is Android- or Windows-specific — but it has **not been tested on an actual iOS device yet**, because that needs a Mac. Expect it to work; don't assume it until someone has run it. |
 
 ## Not built yet
@@ -385,8 +465,11 @@ Deliberately out of scope, not oversights:
 - One currency
 - Expenses only — no income or refunds
 - No edit history on entries
-- No duplicate detection — logging the same purchase twice is on you to notice
+- No duplicate detection when **logging** — entering the same purchase twice is on you to notice.
+  (CSV import does check for exact duplicates, since a re-imported file would otherwise silently
+  double your history.)
 - No bank connection; all entry is manual
 - No manual reordering of labels (alphabetical only)
-- No CSV import — export is a record, not a restore path
+- CSV import restores entries and label names, but **not label nesting** — the export format
+  doesn't carry it
 - Analytics lists at most 50 entries (totals and charts still cover all of them)

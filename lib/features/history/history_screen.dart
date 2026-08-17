@@ -45,6 +45,30 @@ class HistoryScreen extends ConsumerWidget {
     ref.read(historySelectionProvider.notifier).state = <String>{};
   }
 
+  /// Bulk delete, behind the same §3.1 confirmation a single delete uses — the
+  /// dialog states the exact count, since this is the one action here the user
+  /// cannot undo.
+  Future<void> _deleteSelected(
+    BuildContext context,
+    WidgetRef ref,
+    Set<String> selectedIds,
+  ) async {
+    final int count = selectedIds.length;
+    final bool confirmed = await confirmDialog(
+      context,
+      title: count == 1 ? 'Delete transaction' : 'Delete transactions',
+      message: count == 1
+          ? 'Delete this transaction? This cannot be undone.'
+          : 'Delete these $count transactions? This cannot be undone.',
+      confirmLabel: 'Delete',
+      destructive: true,
+    );
+    if (!confirmed) return;
+
+    await ref.read(transactionRepositoryProvider).bulkDelete(selectedIds);
+    ref.read(historySelectionProvider.notifier).state = <String>{};
+  }
+
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final TransactionFilter filter = ref.watch(historyFilterProvider);
@@ -71,6 +95,7 @@ class HistoryScreen extends ConsumerWidget {
             },
             onClear: () => ref.read(historySelectionProvider.notifier).state = <String>{},
             onReassign: () => _reassign(context, ref, selectedIds),
+            onDelete: () => _deleteSelected(context, ref, selectedIds),
           )
         else ...[
           HistoryFilterBar(
@@ -141,19 +166,26 @@ class HistoryScreen extends ConsumerWidget {
 }
 
 /// Replaces the filter bar while a bulk selection is active — select-all
-/// (scoped to whatever's currently filtered in, per §2.5), clear, and reassign.
+/// (scoped to whatever's currently filtered in, per §2.5), clear, reassign,
+/// and delete.
+///
+/// Delete is an icon in the error color rather than a second filled button:
+/// Reassign stays the primary action, and the destructive one should not read
+/// as an equal-weight peer sitting right beside it.
 class _SelectionBar extends StatelessWidget {
   const _SelectionBar({
     required this.selectedCount,
     required this.onSelectAll,
     required this.onClear,
     required this.onReassign,
+    required this.onDelete,
   });
 
   final int selectedCount;
   final VoidCallback onSelectAll;
   final VoidCallback onClear;
   final VoidCallback onReassign;
+  final VoidCallback onDelete;
 
   @override
   Widget build(BuildContext context) {
@@ -175,6 +207,14 @@ class _SelectionBar extends StatelessWidget {
               ),
             ),
             TextButton(onPressed: onSelectAll, child: const Text('Select all')),
+            IconButton(
+              tooltip: selectedCount == 1
+                  ? 'Delete 1 entry'
+                  : 'Delete $selectedCount entries',
+              icon: const Icon(Icons.delete_outline),
+              color: Theme.of(context).colorScheme.error,
+              onPressed: onDelete,
+            ),
             FilledButton(onPressed: onReassign, child: const Text('Reassign')),
           ],
         ),

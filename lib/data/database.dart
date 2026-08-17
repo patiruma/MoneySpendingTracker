@@ -2,13 +2,17 @@ import 'package:drift/drift.dart';
 import 'package:drift_flutter/drift_flutter.dart';
 
 import '../core/constants.dart';
+import 'daos/import_dao.dart';
 import 'daos/label_dao.dart';
 import 'daos/transaction_dao.dart';
 import 'tables.dart';
 
 part 'database.g.dart';
 
-@DriftDatabase(tables: [Labels, Transactions], daos: [LabelDao, TransactionDao])
+@DriftDatabase(
+  tables: [Labels, Transactions],
+  daos: [LabelDao, TransactionDao, ImportDao],
+)
 class AppDatabase extends _$AppDatabase {
   AppDatabase() : super(driftDatabase(name: 'spending_tracker'));
 
